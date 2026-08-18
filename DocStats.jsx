@@ -25,7 +25,16 @@
 
 (function () {
     var VERSION = "1.1.0";
-    var MIN_PRINT_PPI = 200;
+
+    // Output-readiness profiles. General Health preserves the v1.1.0
+    // 200-PPI advisory threshold. Print Production uses a stricter 300-PPI
+    // advisory threshold. EPUB does not apply the print effective-PPI check.
+    var PROFILES = {
+        GENERAL: { key: "GENERAL", name: "General Health", minEffectivePpi: 200 },
+        PRINT: { key: "PRINT", name: "Print Production", minEffectivePpi: 300 },
+        EPUB: { key: "EPUB", name: "EPUB", minEffectivePpi: 0 }
+    };
+    var DEFAULT_PROFILE_KEY = "GENERAL";
 
     if (app.documents.length === 0) {
         alert("DocStats\n\nOpen an InDesign document and run the script again.");
@@ -38,6 +47,7 @@
         findings: [],
         filtered: [],
         scope: "ALL",
+        profileKey: DEFAULT_PROFILE_KEY,
         scannedAt: null
     };
 
@@ -189,6 +199,434 @@
         return fallback || "Document";
     }
 
+
+    function profileFor(key) {
+        if (key && PROFILES[key]) return PROFILES[key];
+        return PROFILES[DEFAULT_PROFILE_KEY];
+    }
+
+    function safeId(obj) {
+        try {
+            if (obj && obj.isValid !== false && obj.id !== undefined) return safeString(obj.id);
+        } catch (e) {}
+        return "";
+    }
+
+    function formatBoundValue(value) {
+        var n = Number(value);
+        if (!isNaN(n)) return String(Math.round(n * 100) / 100);
+        return safeString(value);
+    }
+
+    function geometricBoundsFor(obj) {
+        var item = pageItemOf(obj) || textFrameOf(obj) || obj;
+        try {
+            var b = item.geometricBounds;
+            if (b && b.length === 4) {
+                return "[" + formatBoundValue(b[0]) + ", " + formatBoundValue(b[1]) + ", " +
+                    formatBoundValue(b[2]) + ", " + formatBoundValue(b[3]) + "]";
+            }
+        } catch (e) {}
+        return "";
+    }
+
+    function frameLabelNameFor(obj) {
+        var item = pageItemOf(obj) || textFrameOf(obj) || obj;
+        var label = "";
+        var name = "";
+        try { label = trim(item.label); } catch (e1) {}
+        try { name = trim(item.name); } catch (e2) {}
+        if (label && name && label !== name) return label + " / " + name;
+        return label || name;
+    }
+
+    function textFrameOf(obj) {
+        if (!obj) return null;
+        try {
+            if (ctorName(obj) === "TextFrame") return obj;
+        } catch (e0) {}
+        try {
+            if (obj.parentTextFrames && obj.parentTextFrames.length > 0) return obj.parentTextFrames[0];
+        } catch (e1) {}
+        var current = obj;
+        var depth;
+        for (depth = 0; depth < 12; depth++) {
+            try {
+                if (ctorName(current) === "TextFrame") return current;
+            } catch (e2) {}
+            try {
+                if (current.parentTextFrames && current.parentTextFrames.length > 0) return current.parentTextFrames[0];
+            } catch (e3) {}
+            try {
+                if (!current.parent || current.parent === current) break;
+                current = current.parent;
+            } catch (e4) {
+                break;
+            }
+        }
+        return null;
+    }
+
+    function storyFrameIdFor(obj) {
+        var frame = textFrameOf(obj);
+        var storyId = "";
+        var frameId = "";
+        if (frame) {
+            frameId = safeId(frame);
+            try { storyId = safeId(frame.parentStory); } catch (e1) {}
+        } else {
+            try { storyId = safeId(obj.parentStory); } catch (e2) {}
+        }
+        if (storyId && frameId) return "Story " + storyId + " / Frame " + frameId;
+        if (storyId) return "Story " + storyId;
+        if (frameId) return "Frame " + frameId;
+        return "";
+    }
+
+    function linkFileNameFor(obj) {
+        if (!obj) return "";
+        try {
+            if (ctorName(obj) === "Link") return safeString(obj.name);
+        } catch (e0) {}
+        try {
+            if (obj.itemLink && obj.itemLink.isValid) return safeString(obj.itemLink.name);
+        } catch (e1) {}
+        var item = pageItemOf(obj) || textFrameOf(obj) || obj;
+        try {
+            if (item.allGraphics && item.allGraphics.length > 0) {
+                var g = item.allGraphics[0];
+                if (g.itemLink && g.itemLink.isValid) return safeString(g.itemLink.name);
+            }
+        } catch (e2) {}
+        try {
+            if (obj.parent && obj.parent.itemLink && obj.parent.itemLink.isValid) return safeString(obj.parent.itemLink.name);
+        } catch (e3) {}
+        return "";
+    }
+
+    function objectMetadataFor(obj) {
+        var item = pageItemOf(obj) || textFrameOf(obj) || obj;
+        return {
+            objectId: safeId(item),
+            objectType: ctorName(item) || ctorName(obj),
+            linkFileName: linkFileNameFor(obj),
+            frameLabelName: frameLabelNameFor(obj),
+            geometricBounds: geometricBoundsFor(obj),
+            storyFrameId: storyFrameIdFor(obj)
+        };
+    }
+
+    function oneLineText(value, maxLen) {
+        var s = trim(safeString(value).replace(/\r\n|\r|\n|\t/g, " ").replace(/\s+/g, " "));
+        if (maxLen && s.length > maxLen) s = s.substring(0, maxLen - 3) + "...";
+        return s;
+    }
+
+    function incrementCount(map, key) {
+        if (!key) key = "Unknown";
+        if (map[key] === undefined) map[key] = 0;
+        map[key]++;
+    }
+
+    function inlinePageItemFromText(text) {
+        if (!text) return null;
+        var contents = "";
+        try { contents = safeString(text.contents); } catch (eContents) {}
+        var compact = contents.replace(/\s+/g, "");
+        if (!compact || compact.replace(/\uFFFC/g, "") !== "") return null;
+        try {
+            if (text.allPageItems && text.allPageItems.length > 0) return text.allPageItems[0];
+        } catch (eAll) {}
+        try {
+            var chars = text.characters;
+            var i;
+            for (i = 0; i < chars.length; i++) {
+                try {
+                    if (chars[i].allPageItems && chars[i].allPageItems.length > 0) {
+                        return chars[i].allPageItems[0];
+                    }
+                } catch (eChar) {}
+            }
+        } catch (eChars) {}
+        return null;
+    }
+
+    function hyperlinkScheme(direction, category, destination) {
+        if (direction === "INTERNAL") return "internal";
+        if (category === "External document page") return "file";
+        var value = trim(destination);
+        var match = /^([A-Za-z][A-Za-z0-9+.-]*):/.exec(value);
+        if (match && match[1]) return safeString(match[1]).toLowerCase();
+        if (direction === "EXTERNAL") return "other";
+        return "unknown";
+    }
+
+    function hyperlinkDomain(scheme, destination) {
+        var value = trim(destination);
+        var host = "";
+        if (scheme === "http" || scheme === "https" || scheme === "ftp") {
+            value = value.replace(/^[A-Za-z][A-Za-z0-9+.-]*:\/\//, "");
+            host = value.split(/[\/?#]/)[0];
+            if (host.indexOf("@") >= 0) host = host.substring(host.lastIndexOf("@") + 1);
+            if (host.charAt(0) === "[") {
+                var close = host.indexOf("]");
+                if (close >= 0) host = host.substring(0, close + 1);
+            } else if (host.indexOf(":") >= 0) {
+                host = host.split(":")[0];
+            }
+        } else if (scheme === "mailto") {
+            value = value.replace(/^mailto:/i, "").split(/[?]/)[0];
+            if (value.indexOf("@") >= 0) host = value.substring(value.lastIndexOf("@") + 1);
+        }
+        host = safeString(host).toLowerCase();
+        if (host.indexOf("www.") === 0) host = host.substring(4);
+        return host;
+    }
+
+    function looksLikeRawUrlSource(sourceText, destination) {
+        var source = trim(sourceText);
+        if (!source) return false;
+        if (/^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(source)) return true;
+        if (/^(mailto:|tel:|file:|ftp:)/i.test(source)) return true;
+        if (/^(www\.)?[A-Za-z0-9.-]+\.[A-Za-z]{2,}(?:[\/?#].*)?$/.test(source)) return true;
+        var dest = trim(destination);
+        if (dest && source.toLowerCase() === dest.toLowerCase()) return true;
+        return false;
+    }
+
+    function sourceFormFor(sourceType, sourceText, linkFileName, destination) {
+        if (sourceType === "Inline graphic") return "Inline graphic";
+        if (sourceType === "Page item") return linkFileName ? "Graphic" : "Page item";
+        if (sourceType === "Cross-reference text") return "Cross-reference";
+        if (sourceType === "Text") {
+            return looksLikeRawUrlSource(sourceText, destination) ? "Raw URL" : "Descriptive text";
+        }
+        return sourceType || "Other";
+    }
+
+    function suspiciousTrailingUrlPunctuation(destination) {
+        var value = trim(destination);
+        if (!value) return false;
+        return /[.,;:]$/.test(value);
+    }
+
+    function hyperlinkSourceInfo(hyperlink) {
+        var result = {
+            target: null,
+            sourceType: "Unknown",
+            sourceText: "",
+            pageName: "",
+            objectId: "",
+            objectType: "",
+            linkFileName: "",
+            frameLabelName: "",
+            geometricBounds: "",
+            storyFrameId: ""
+        };
+        try {
+            var source = hyperlink.source;
+            var sourceType = ctorName(source);
+            if (sourceType === "HyperlinkTextSource" || sourceType === "CrossReferenceSource") {
+                var text = source.sourceText;
+                var inlineItem = inlinePageItemFromText(text);
+                if (inlineItem) {
+                    result.target = inlineItem;
+                    result.sourceType = "Inline graphic";
+                    var inlineFile = linkFileNameFor(inlineItem);
+                    var inlineLabel = frameLabelNameFor(inlineItem);
+                    if (inlineFile) result.sourceText = inlineFile;
+                    else if (inlineLabel) result.sourceText = inlineLabel;
+                    else result.sourceText = ctorName(inlineItem) || "Inline graphic";
+                } else {
+                    result.target = text;
+                    result.sourceType = sourceType === "CrossReferenceSource" ? "Cross-reference text" : "Text";
+                    try { result.sourceText = oneLineText(text.contents, 180); } catch (eText) {}
+                }
+            } else if (sourceType === "HyperlinkPageItemSource") {
+                var item = source.sourcePageItem;
+                result.target = item;
+                result.sourceType = "Page item";
+                var fileName = linkFileNameFor(item);
+                var labelName = frameLabelNameFor(item);
+                if (fileName) result.sourceText = "Graphic: " + fileName;
+                else if (labelName) result.sourceText = labelName;
+                else result.sourceText = ctorName(item) || "Page item";
+            } else {
+                result.target = source;
+                result.sourceType = sourceType || "Unknown";
+                try { result.sourceText = oneLineText(source.name, 180); } catch (eName) {}
+            }
+        } catch (eSource) {}
+
+        var page = pageOf(result.target);
+        result.pageName = pageName(page);
+        var meta = objectMetadataFor(result.target);
+        result.objectId = meta.objectId;
+        result.objectType = meta.objectType;
+        result.linkFileName = meta.linkFileName;
+        result.frameLabelName = meta.frameLabelName;
+        result.geometricBounds = meta.geometricBounds;
+        result.storyFrameId = meta.storyFrameId;
+        return result;
+    }
+
+    function hyperlinkDestinationInfo(hyperlink) {
+        var result = {
+            direction: "UNKNOWN",
+            category: "Unknown destination",
+            destination: ""
+        };
+        try {
+            var dest = hyperlink.destination;
+            var typeName = ctorName(dest);
+            if (typeName === "HyperlinkPageDestination") {
+                result.direction = "INTERNAL";
+                result.category = "Page";
+                try { result.destination = "Page " + pageName(dest.destinationPage); } catch (ePage) {}
+            } else if (typeName === "HyperlinkTextDestination") {
+                result.direction = "INTERNAL";
+                result.category = "Text";
+                try {
+                    result.destination = locationFor(dest.destinationText, "Document") + " | " +
+                        oneLineText(dest.destinationText.contents, 120);
+                } catch (eText) {}
+            } else if (typeName === "ParagraphDestination") {
+                result.direction = "INTERNAL";
+                result.category = "Paragraph";
+                try {
+                    result.destination = locationFor(dest.destinationText, "Document") + " | " +
+                        oneLineText(dest.destinationText.paragraphs[0].contents, 120);
+                } catch (eParagraph) {}
+            } else if (typeName === "HyperlinkExternalPageDestination") {
+                result.direction = "EXTERNAL";
+                result.category = "External document page";
+                try {
+                    result.destination = safeString(dest.documentPath.fsName) + " | page index " + safeString(dest.destinationPageIndex);
+                } catch (eExternalPage) {}
+            } else if (typeName === "HyperlinkURLDestination") {
+                var url = "";
+                try { url = trim(dest.destinationURL); } catch (eUrl) {}
+                result.destination = url;
+                if (!url) {
+                    result.direction = "UNKNOWN";
+                    result.category = "Empty URL";
+                } else if (/^#/i.test(url)) {
+                    result.direction = "INTERNAL";
+                    result.category = "Fragment";
+                } else {
+                    result.direction = "EXTERNAL";
+                    if (/^https?:/i.test(url)) result.category = "Web URL";
+                    else if (/^mailto:/i.test(url)) result.category = "Email";
+                    else if (/^tel:/i.test(url)) result.category = "Telephone";
+                    else if (/^file:/i.test(url)) result.category = "File URL";
+                    else if (/^ftp:/i.test(url)) result.category = "FTP";
+                    else result.category = "Other URL";
+                }
+            } else {
+                result.direction = "UNKNOWN";
+                result.category = typeName || "Unknown destination";
+                try { result.destination = oneLineText(dest.name, 180); } catch (eUnknown) {}
+            }
+        } catch (eDestination) {}
+        return result;
+    }
+
+    function hyperlinkRecord(hyperlink) {
+        var source = hyperlinkSourceInfo(hyperlink);
+        var dest = hyperlinkDestinationInfo(hyperlink);
+        var scheme = hyperlinkScheme(dest.direction, dest.category, dest.destination);
+        var domain = hyperlinkDomain(scheme, dest.destination);
+        return {
+            hyperlinkId: safeId(hyperlink),
+            hyperlinkName: (function () { try { return safeString(hyperlink.name); } catch (e) { return ""; } })(),
+            direction: dest.direction,
+            category: dest.category,
+            scheme: scheme,
+            domain: domain,
+            pageName: source.pageName,
+            sourceType: source.sourceType,
+            sourceText: source.sourceText,
+            sourceForm: sourceFormFor(source.sourceType, source.sourceText, source.linkFileName, dest.destination),
+            destination: dest.destination,
+            repetition: "",
+            destinationOccurrences: 0,
+            target: source.target,
+            objectId: source.objectId,
+            objectType: source.objectType,
+            linkFileName: source.linkFileName,
+            frameLabelName: source.frameLabelName,
+            geometricBounds: source.geometricBounds,
+            storyFrameId: source.storyFrameId
+        };
+    }
+
+    function hyperlinkDestinationKey(record) {
+        return record.direction + "|" + trim(record.destination);
+    }
+
+    function addHyperlinkFindings(stats) {
+        var records = stats.hyperlinkRecords || [];
+        var bySourcePage = {};
+        var i;
+
+        for (i = 0; i < records.length; i++) {
+            var r = records[i];
+
+            if (r.scheme === "http") {
+                addFinding(
+                    "INFO",
+                    "DOCUMENT",
+                    "HYP-002",
+                    "HTTP hyperlink destination",
+                    "The hyperlink destination uses HTTP rather than HTTPS: " + r.destination + ". Review whether an equivalent HTTPS endpoint exists before publication.",
+                    r.target
+                );
+            }
+
+            if ((r.scheme === "http" || r.scheme === "https" || r.scheme === "ftp") && suspiciousTrailingUrlPunctuation(r.destination)) {
+                addFinding(
+                    "WARNING",
+                    "DOCUMENT",
+                    "HYP-003",
+                    "Suspicious trailing URL punctuation",
+                    "The hyperlink destination ends with punctuation that may have been captured from surrounding prose: " + r.destination + ". Verify the destination before publication.",
+                    r.target
+                );
+            }
+
+            if ((r.sourceForm === "Descriptive text" || r.sourceForm === "Raw URL" || r.sourceForm === "Cross-reference") && r.pageName && trim(r.sourceText)) {
+                var sourceKey = r.pageName + "|" + trim(r.sourceText).toLowerCase();
+                if (!bySourcePage[sourceKey]) {
+                    bySourcePage[sourceKey] = { pageName: r.pageName, sourceText: r.sourceText, records: [], destinations: {} };
+                }
+                bySourcePage[sourceKey].records.push(r);
+                bySourcePage[sourceKey].destinations[trim(r.destination)] = true;
+            }
+        }
+
+        var key;
+        for (key in bySourcePage) {
+            if (!bySourcePage.hasOwnProperty(key)) continue;
+            var group = bySourcePage[key];
+            var destinations = [];
+            var destination;
+            for (destination in group.destinations) {
+                if (group.destinations.hasOwnProperty(destination)) destinations.push(destination);
+            }
+            if (destinations.length > 1) {
+                destinations.sort();
+                addFinding(
+                    "WARNING",
+                    "DOCUMENT",
+                    "HYP-001",
+                    "Same hyperlink source text has multiple destinations: " + oneLineText(group.sourceText, 100),
+                    "On Page " + group.pageName + ", the same source text points to multiple destinations: " + destinations.join("; ") + ". Review which destination is intended.",
+                    group.records[0].target
+                );
+            }
+        }
+    }
+
     function minPpi(value) {
         var n = 0;
         try {
@@ -218,6 +656,7 @@
 
     function addFinding(severity, scope, code, title, detail, target, actionLabel, actionFn) {
         var page = pageOf(target);
+        var meta = objectMetadataFor(target);
         state.findings.push({
             severity: severity,
             scope: scope,
@@ -228,6 +667,12 @@
             page: page,
             pageName: pageName(page),
             location: locationFor(target, "Document"),
+            objectId: meta.objectId,
+            objectType: meta.objectType,
+            linkFileName: meta.linkFileName,
+            frameLabelName: meta.frameLabelName,
+            geometricBounds: meta.geometricBounds,
+            storyFrameId: meta.storyFrameId,
             actionLabel: actionLabel || "",
             actionFn: actionFn || null
         });
@@ -401,9 +846,12 @@
         } catch (eSelect) {}
     }
 
-    function scanDocument() {
+    function scanDocument(profileKey) {
         state.findings = [];
+        state.profileKey = profileFor(profileKey || state.profileKey).key;
         state.scannedAt = new Date();
+
+        var activeProfile = profileFor(state.profileKey);
 
         var stats = {
             pages: safeLength(doc.pages),
@@ -431,12 +879,26 @@
             otherLinkStatus: 0,
             fonts: safeLength(doc.fonts),
             missingFonts: 0,
+            missingFontsLive: 0,
+            missingFontsReferencedOnly: 0,
             paragraphStyles: 0,
             characterStyles: 0,
             objectStyles: 0,
             tableStyles: 0,
             cellStyles: 0,
             hyperlinks: safeLength(doc.hyperlinks),
+            hyperlinkInternal: 0,
+            hyperlinkExternal: 0,
+            hyperlinkUnknown: 0,
+            hyperlinkCategories: {},
+            hyperlinkSchemes: {},
+            hyperlinkDomains: {},
+            hyperlinkSourceForms: {},
+            hyperlinkDestinationCounts: {},
+            hyperlinkUniqueDestinations: 0,
+            hyperlinkRepeatedDestinations: 0,
+            hyperlinkRepeatedOccurrences: 0,
+            hyperlinkRecords: [],
             crossReferences: safeLength(doc.crossReferenceSources),
             bookmarks: safeLength(doc.bookmarks),
             articles: 0
@@ -581,22 +1043,74 @@
             }
         }
 
-        // Fonts.
+        // Fonts. DOC-006A reports unavailable fonts used by live text.
+        // DOC-006B reports unavailable font references with no live text use found.
+        var unavailableFonts = [];
+        var liveMissingByName = {};
+
         for (i = 0; i < stats.fonts; i++) {
             try {
                 var font = doc.fonts[i];
                 if (font.status !== FontStatus.INSTALLED) {
+                    var fontName = safeString(font.name);
                     stats.missingFonts++;
+                    unavailableFonts.push(font);
+                }
+            } catch (eFontRef) {}
+        }
+
+        for (i = 0; i < stats.stories; i++) {
+            try {
+                var fontStory = doc.stories[i];
+                var ranges = fontStory.textStyleRanges;
+                var r;
+                for (r = 0; r < ranges.length; r++) {
+                    try {
+                        var range = ranges[r];
+                        var applied = range.appliedFont;
+                        var appliedStatus = null;
+                        try { appliedStatus = applied.status; } catch (eAppliedStatus) { appliedStatus = null; }
+                        if (applied && appliedStatus !== null && appliedStatus !== FontStatus.INSTALLED) {
+                            var appliedName = safeString(applied.name);
+                            var usageKey = "$" + appliedName;
+                            if (!liveMissingByName[usageKey]) {
+                                liveMissingByName[usageKey] = { font: applied, target: range, ranges: 0 };
+                            }
+                            liveMissingByName[usageKey].ranges++;
+                        }
+                    } catch (eRange) {}
+                }
+            } catch (eFontStory) {}
+        }
+
+        for (i = 0; i < unavailableFonts.length; i++) {
+            try {
+                var unavailableFont = unavailableFonts[i];
+                var unavailableName = safeString(unavailableFont.name);
+                var liveUse = liveMissingByName["$" + unavailableName];
+                if (liveUse) {
+                    stats.missingFontsLive++;
                     addFinding(
                         "ERROR",
                         "DOCUMENT",
-                        "DOC-006",
-                        "Font unavailable: " + safeString(font.name),
-                        "The document references a font that InDesign does not report as installed and available. Location is document-wide because the font object does not expose a direct page reference.",
+                        "DOC-006A",
+                        "Unavailable font used by live text: " + unavailableName,
+                        "Live composed text uses a font that InDesign does not report as installed and available. The reported target is the first detected text-style range; " +
+                            fmt(liveUse.ranges) + " text-style range(s) use this unavailable font.",
+                        liveUse.target
+                    );
+                } else {
+                    stats.missingFontsReferencedOnly++;
+                    addFinding(
+                        "INFO",
+                        "DOCUMENT",
+                        "DOC-006B",
+                        "Unavailable font referenced but no live text use found: " + unavailableName,
+                        "The document references this unavailable font, but DocStats did not find it applied to live text-style ranges. The reference can come from styles, imported content, or other document resources and should be reviewed before removal or substitution.",
                         null
                     );
                 }
-            } catch (eFont) {}
+            } catch (eFontFinding) {}
         }
 
         // Style counts.
@@ -620,13 +1134,13 @@
                 if (typeName === "Image") {
                     try {
                         var effective = minPpi(graphic.effectivePpi);
-                        if (effective > 0 && effective < MIN_PRINT_PPI) {
+                        if (activeProfile.minEffectivePpi > 0 && effective > 0 && effective < activeProfile.minEffectivePpi) {
                             addFinding(
                                 "WARNING",
                                 "PRINT/PDF",
                                 "PRINT-001",
                                 "Low effective image resolution: " + Math.round(effective) + " PPI",
-                                "The bitmap image is below the DocStats advisory threshold of " + MIN_PRINT_PPI + " effective PPI. Required resolution depends on output process, line screen, and viewing distance.",
+                                "The bitmap image is below the " + activeProfile.name + " profile advisory threshold of " + activeProfile.minEffectivePpi + " effective PPI. Required resolution depends on output process, line screen, source content, and viewing distance.",
                                 graphic
                             );
                         }
@@ -663,6 +1177,44 @@
                 }
             } catch (eGraphic) {}
         }
+
+        // Hyperlink inventory. Hyperlinks are classified independently from link-file status.
+        for (i = 0; i < stats.hyperlinks; i++) {
+            try {
+                var hyperlink = doc.hyperlinks[i];
+                var record = hyperlinkRecord(hyperlink);
+                stats.hyperlinkRecords.push(record);
+                if (record.direction === "INTERNAL") stats.hyperlinkInternal++;
+                else if (record.direction === "EXTERNAL") stats.hyperlinkExternal++;
+                else stats.hyperlinkUnknown++;
+                incrementCount(stats.hyperlinkCategories, record.direction + " | " + record.category);
+                incrementCount(stats.hyperlinkSchemes, record.scheme);
+                incrementCount(stats.hyperlinkSourceForms, record.sourceForm);
+                if (record.domain) incrementCount(stats.hyperlinkDomains, record.domain);
+                incrementCount(stats.hyperlinkDestinationCounts, hyperlinkDestinationKey(record));
+            } catch (eHyperlink) {
+                stats.hyperlinkUnknown++;
+                incrementCount(stats.hyperlinkCategories, "UNKNOWN | Scan error");
+                incrementCount(stats.hyperlinkSchemes, "unknown");
+            }
+        }
+
+        var destinationKey;
+        for (destinationKey in stats.hyperlinkDestinationCounts) {
+            if (!stats.hyperlinkDestinationCounts.hasOwnProperty(destinationKey)) continue;
+            stats.hyperlinkUniqueDestinations++;
+            if (stats.hyperlinkDestinationCounts[destinationKey] > 1) {
+                stats.hyperlinkRepeatedDestinations++;
+                stats.hyperlinkRepeatedOccurrences += stats.hyperlinkDestinationCounts[destinationKey];
+            }
+        }
+        for (i = 0; i < stats.hyperlinkRecords.length; i++) {
+            var hyperlinkRecordItem = stats.hyperlinkRecords[i];
+            var occurrenceCount = stats.hyperlinkDestinationCounts[hyperlinkDestinationKey(hyperlinkRecordItem)] || 1;
+            hyperlinkRecordItem.destinationOccurrences = occurrenceCount;
+            hyperlinkRecordItem.repetition = occurrenceCount > 1 ? "Repeated destination" : "Unique destination";
+        }
+        addHyperlinkFindings(stats);
 
         // EPUB document metadata.
         try {
@@ -725,6 +1277,103 @@
         return stats;
     }
 
+    function findingSummaryLines(findings) {
+        var lines = [];
+        var errors = 0;
+        var warnings = 0;
+        var infos = 0;
+        var scopes = { "DOCUMENT": 0, "PRINT/PDF": 0, "EPUB": 0 };
+        var codes = {};
+        var codeOrder = [];
+        var i;
+        for (i = 0; i < findings.length; i++) {
+            var f = findings[i];
+            if (f.severity === "ERROR") errors++;
+            else if (f.severity === "WARNING") warnings++;
+            else infos++;
+            if (scopes[f.scope] === undefined) scopes[f.scope] = 0;
+            scopes[f.scope]++;
+            if (codes[f.code] === undefined) {
+                codes[f.code] = 0;
+                codeOrder.push(f.code);
+            }
+            codes[f.code]++;
+        }
+        codeOrder.sort();
+        lines.push("Total findings: " + fmt(findings.length));
+        lines.push("");
+        lines.push("By severity");
+        lines.push("ERROR: " + fmt(errors));
+        lines.push("WARNING: " + fmt(warnings));
+        lines.push("INFO: " + fmt(infos));
+        lines.push("");
+        lines.push("By scope");
+        lines.push("DOCUMENT: " + fmt(scopes["DOCUMENT"] || 0));
+        lines.push("PRINT/PDF: " + fmt(scopes["PRINT/PDF"] || 0));
+        lines.push("EPUB: " + fmt(scopes["EPUB"] || 0));
+        lines.push("");
+        lines.push("By code");
+        for (i = 0; i < codeOrder.length; i++) {
+            var code = codeOrder[i];
+            lines.push(code + ": " + fmt(codes[code]));
+        }
+        return lines;
+    }
+
+    function findingObjectLines(f) {
+        var lines = [];
+        if (f.objectId) lines.push("  Object ID: " + f.objectId);
+        if (f.objectType) lines.push("  Object type: " + f.objectType);
+        if (f.linkFileName) lines.push("  Link/file name: " + f.linkFileName);
+        if (f.frameLabelName) lines.push("  Frame label/name: " + f.frameLabelName);
+        if (f.geometricBounds) lines.push("  Geometric bounds: " + f.geometricBounds);
+        if (f.storyFrameId) lines.push("  Story/frame ID: " + f.storyFrameId);
+        return lines;
+    }
+
+    function countMapLines(map, limit) {
+        var rows = [];
+        var key;
+        for (key in map) {
+            if (map.hasOwnProperty(key)) rows.push({ key: key, count: map[key] });
+        }
+        rows.sort(function (a, b) {
+            if (a.count !== b.count) return b.count - a.count;
+            return a.key < b.key ? -1 : (a.key > b.key ? 1 : 0);
+        });
+        var lines = [];
+        var max = limit && limit < rows.length ? limit : rows.length;
+        var i;
+        for (i = 0; i < max; i++) lines.push(rows[i].key + ": " + fmt(rows[i].count));
+        if (limit && rows.length > limit) lines.push("Other entries: " + fmt(rows.length - limit));
+        return lines;
+    }
+
+    function hyperlinkSummaryLines(stats) {
+        var lines = [];
+        lines.push("Internal: " + fmt(stats.hyperlinkInternal));
+        lines.push("External: " + fmt(stats.hyperlinkExternal));
+        lines.push("Unknown: " + fmt(stats.hyperlinkUnknown));
+        lines.push("Unique destinations: " + fmt(stats.hyperlinkUniqueDestinations));
+        lines.push("Repeated destination values: " + fmt(stats.hyperlinkRepeatedDestinations));
+        lines.push("Occurrences using repeated destinations: " + fmt(stats.hyperlinkRepeatedOccurrences));
+        lines.push("");
+        lines.push("Destination categories");
+        lines = lines.concat(countMapLines(stats.hyperlinkCategories, 0));
+        lines.push("");
+        lines.push("Schemes");
+        lines = lines.concat(countMapLines(stats.hyperlinkSchemes, 0));
+        lines.push("");
+        lines.push("Source forms");
+        lines = lines.concat(countMapLines(stats.hyperlinkSourceForms, 0));
+        lines.push("");
+        lines.push("Top domains");
+        lines = lines.concat(countMapLines(stats.hyperlinkDomains, 20));
+        lines.push("");
+        lines.push("Complete page-by-page hyperlink inventory: Save hyperlinks CSV...");
+        return lines;
+    }
+
     function reportLines(scope) {
         var s = state.stats;
         var findings = filteredFindings(scope);
@@ -737,6 +1386,9 @@
         lines.push("Document: " + doc.name);
         lines.push("Generated: " + timestamp(state.scannedAt || new Date()));
         lines.push("Scope: " + scope);
+        var activeProfile = profileFor(state.profileKey);
+        lines.push("Profile: " + activeProfile.name);
+        lines.push("Effective PPI advisory threshold: " + (activeProfile.minEffectivePpi > 0 ? activeProfile.minEffectivePpi + " PPI" : "disabled"));
         lines.push("Saved: " + yesNo(doc.saved));
         lines.push("Modified since last save: " + yesNo(doc.modified));
         try { if (doc.saved) lines.push("Path: " + doc.fullName.fsName); } catch (ePath) {}
@@ -779,8 +1431,10 @@
         lines.push("");
         lines.push("FONTS AND STYLES");
         lines.push("----------------");
-        lines.push("Fonts used: " + fmt(s.fonts));
+        lines.push("Fonts referenced: " + fmt(s.fonts));
         lines.push("Fonts unavailable: " + fmt(s.missingFonts));
+        lines.push("Unavailable fonts used by live text: " + fmt(s.missingFontsLive));
+        lines.push("Unavailable fonts referenced only: " + fmt(s.missingFontsReferencedOnly));
         lines.push("Paragraph styles: " + fmt(s.paragraphStyles));
         lines.push("Character styles: " + fmt(s.characterStyles));
         lines.push("Object styles: " + fmt(s.objectStyles));
@@ -791,9 +1445,22 @@
         lines.push("NAVIGATION / INTERACTIVE");
         lines.push("------------------------");
         lines.push("Hyperlinks: " + fmt(s.hyperlinks));
+        lines.push("Internal hyperlinks: " + fmt(s.hyperlinkInternal));
+        lines.push("External hyperlinks: " + fmt(s.hyperlinkExternal));
+        lines.push("Unknown/unresolved hyperlinks: " + fmt(s.hyperlinkUnknown));
         lines.push("Cross-reference sources: " + fmt(s.crossReferences));
         lines.push("Bookmarks: " + fmt(s.bookmarks));
         lines.push("Articles: " + fmt(s.articles));
+
+        lines.push("");
+        lines.push("HYPERLINK SUMMARY");
+        lines.push("-----------------");
+        lines = lines.concat(hyperlinkSummaryLines(s));
+
+        lines.push("");
+        lines.push("FINDINGS SUMMARY");
+        lines.push("----------------");
+        lines = lines.concat(findingSummaryLines(findings));
 
         lines.push("");
         lines.push("FINDINGS");
@@ -808,6 +1475,7 @@
                     " | " + f.location + " | " + f.title
                 );
                 lines.push("  " + f.detail);
+                lines = lines.concat(findingObjectLines(f));
                 if (f.actionLabel) lines.push("  Available action: " + f.actionLabel);
             }
         }
@@ -817,7 +1485,7 @@
         lines.push("- Scan operations are read-only.");
         lines.push("- Actions run only after explicit user selection; destructive or ambiguous remediation is intentionally excluded.");
         lines.push("- Locate uses the page and selection InDesign exposes for the affected object.");
-        lines.push("- The " + MIN_PRINT_PPI + " PPI image threshold is advisory and can be changed in the script constant MIN_PRINT_PPI.");
+        lines.push("- Effective-PPI checks use the selected profile; profile values are advisory production defaults defined in PROFILES near the top of the script.");
         lines.push("- EPUB findings are pre-export review signals; export intent and accessibility decisions still require editorial judgment.");
 
         return lines;
@@ -865,16 +1533,23 @@
             outFile.encoding = "UTF-8";
             outFile.lineFeed = "Windows";
             if (!outFile.open("w")) throw new Error("Could not open selected file for writing.");
-            outFile.writeln("Severity,Scope,Code,Page,Location,Finding,Detail,Action");
+            outFile.writeln("Severity,Scope,Profile,Code,Page,Location,Object ID,Object type,Link/file name,Frame label/name,Geometric bounds,Story/frame ID,Finding,Detail,Action");
             var i;
             for (i = 0; i < findings.length; i++) {
                 var f = findings[i];
                 outFile.writeln([
                     csvEscape(f.severity),
                     csvEscape(f.scope),
+                    csvEscape(profileFor(state.profileKey).name),
                     csvEscape(f.code),
                     csvEscape(f.pageName),
                     csvEscape(f.location),
+                    csvEscape(f.objectId),
+                    csvEscape(f.objectType),
+                    csvEscape(f.linkFileName),
+                    csvEscape(f.frameLabelName),
+                    csvEscape(f.geometricBounds),
+                    csvEscape(f.storyFrameId),
                     csvEscape(f.title),
                     csvEscape(f.detail),
                     csvEscape(f.actionLabel)
@@ -888,11 +1563,62 @@
         }
     }
 
+    function saveHyperlinkCsv() {
+        var records = state.stats.hyperlinkRecords || [];
+        var now = state.scannedAt || new Date();
+        var baseName = doc.name.replace(/\.[^\.]+$/, "");
+        var suggestedName = baseName + "_DocStats_Hyperlinks_" + fileTimestamp(now) + ".csv";
+        var defaultFile;
+        try {
+            defaultFile = doc.saved ? File(doc.filePath.fsName + "/" + suggestedName) : File(Folder.desktop.fsName + "/" + suggestedName);
+        } catch (eDefault) {
+            defaultFile = File(Folder.desktop.fsName + "/" + suggestedName);
+        }
+        var outFile = defaultFile.saveDlg("Save DocStats hyperlink inventory", "CSV Files:*.csv");
+        if (!outFile) return;
+        try {
+            outFile.encoding = "UTF-8";
+            outFile.lineFeed = "Windows";
+            if (!outFile.open("w")) throw new Error("Could not open selected file for writing.");
+            outFile.writeln("Direction,Category,Scheme,Domain,Page,Source type,Source form,Source text/graphic,Destination,Repetition,Destination occurrences,Hyperlink ID,Hyperlink name,Object ID,Object type,Link/file name,Frame label/name,Geometric bounds,Story/frame ID");
+            var i;
+            for (i = 0; i < records.length; i++) {
+                var h = records[i];
+                outFile.writeln([
+                    csvEscape(h.direction),
+                    csvEscape(h.category),
+                    csvEscape(h.scheme),
+                    csvEscape(h.domain),
+                    csvEscape(h.pageName),
+                    csvEscape(h.sourceType),
+                    csvEscape(h.sourceForm),
+                    csvEscape(h.sourceText),
+                    csvEscape(h.destination),
+                    csvEscape(h.repetition),
+                    csvEscape(h.destinationOccurrences),
+                    csvEscape(h.hyperlinkId),
+                    csvEscape(h.hyperlinkName),
+                    csvEscape(h.objectId),
+                    csvEscape(h.objectType),
+                    csvEscape(h.linkFileName),
+                    csvEscape(h.frameLabelName),
+                    csvEscape(h.geometricBounds),
+                    csvEscape(h.storyFrameId)
+                ].join(","));
+            }
+            outFile.close();
+            alert("DocStats hyperlink CSV saved:\n\n" + outFile.fsName);
+        } catch (e) {
+            try { if (outFile.opened) outFile.close(); } catch (eClose) {}
+            alert("DocStats could not save the hyperlink CSV.\n\n" + e);
+        }
+    }
+
     // ------------------------------------------------------------
     // ScriptUI palette
     // ------------------------------------------------------------
 
-    scanDocument();
+    scanDocument(DEFAULT_PROFILE_KEY);
 
     var win = new Window("palette", "DocStats " + VERSION + " - " + doc.name, undefined, {resizeable: true});
     win.orientation = "column";
@@ -906,10 +1632,14 @@
     controls.add("statictext", undefined, "Scope:");
     var scopeList = controls.add("dropdownlist", undefined, ["All", "Document", "Print/PDF", "EPUB"]);
     scopeList.selection = 0;
+    controls.add("statictext", undefined, "Profile:");
+    var profileList = controls.add("dropdownlist", undefined, ["General Health", "Print Production", "EPUB"]);
+    profileList.selection = 0;
 
     var scanButton = controls.add("button", undefined, "Scan");
     var saveButton = controls.add("button", undefined, "Save report...");
-    var csvButton = controls.add("button", undefined, "Save CSV...");
+    var csvButton = controls.add("button", undefined, "Save findings CSV...");
+    var hyperlinkCsvButton = controls.add("button", undefined, "Save hyperlinks CSV...");
 
     var summary = win.add("statictext", undefined, "", {multiline: false});
 
@@ -946,6 +1676,14 @@
         return "EPUB";
     }
 
+    function selectedProfileKey() {
+        if (!profileList.selection) return DEFAULT_PROFILE_KEY;
+        var label = profileList.selection.text;
+        if (label === "Print Production") return "PRINT";
+        if (label === "EPUB") return "EPUB";
+        return "GENERAL";
+    }
+
     function currentFinding() {
         if (!list.selection) return null;
         var idx = list.selection.index;
@@ -964,8 +1702,14 @@
         }
         detail.text =
             f.severity + " | " + f.scope + " | " + f.code + "\r" +
-            f.location + "\r\r" +
-            f.title + "\r" +
+            f.location + "\r" +
+            (f.objectId ? "Object ID: " + f.objectId + "\r" : "") +
+            (f.objectType ? "Object type: " + f.objectType + "\r" : "") +
+            (f.linkFileName ? "Link/file name: " + f.linkFileName + "\r" : "") +
+            (f.frameLabelName ? "Frame label/name: " + f.frameLabelName + "\r" : "") +
+            (f.geometricBounds ? "Geometric bounds: " + f.geometricBounds + "\r" : "") +
+            (f.storyFrameId ? "Story/frame ID: " + f.storyFrameId + "\r" : "") +
+            "\r" + f.title + "\r" +
             f.detail;
         locateButton.enabled = !!f.target;
         actionButton.enabled = !!f.actionFn;
@@ -999,6 +1743,7 @@
             "Pages " + fmt(state.stats.pages) +
             " | Stories " + fmt(state.stats.stories) +
             " | Links " + fmt(state.stats.links) +
+            " | Profile " + profileFor(state.profileKey).name +
             " | Findings " + fmt(state.filtered.length) +
             " (" + errors + " error, " + warnings + " warning, " + infos + " info)";
 
@@ -1006,10 +1751,14 @@
     }
 
     scopeList.onChange = refreshList;
+    profileList.onChange = function () {
+        scanDocument(selectedProfileKey());
+        refreshList();
+    };
     list.onChange = updateDetail;
 
     scanButton.onClick = function () {
-        scanDocument();
+        scanDocument(selectedProfileKey());
         refreshList();
     };
 
@@ -1019,6 +1768,10 @@
 
     csvButton.onClick = function () {
         saveCsv(selectedScope());
+    };
+
+    hyperlinkCsvButton.onClick = function () {
+        saveHyperlinkCsv();
     };
 
     locateButton.onClick = function () {
@@ -1031,7 +1784,7 @@
         var changed = false;
         try { changed = !!f.actionFn(); } catch (e) { alert("DocStats action failed.\n\n" + e); }
         if (changed) {
-            scanDocument();
+            scanDocument(state.profileKey);
             refreshList();
         }
     };

@@ -6,9 +6,9 @@ DocStats is expected to grow from a statistics script into an InDesign productio
 
 ### Better location resolution
 
-- resolve individual occurrences of unavailable fonts
+- expand unavailable-font reporting from first live occurrence to optional all-occurrence navigation
 - identify text ranges carrying style overrides
-- locate problematic hyperlink source text precisely
+- add previous/next navigation through hyperlink inventory entries
 - distinguish page, pasteboard, master/parent page, and anchored-object locations
 
 ### Visual targeting
@@ -19,7 +19,7 @@ DocStats is expected to grow from a statistics script into an InDesign productio
 
 ### Print/PDF checks
 
-- richer effective-PPI policies by image class or production profile
+- extend output-readiness profiles beyond effective PPI to additional print/PDF checks
 - color-space and profile review
 - transparency and overprint signals where they are operationally useful
 - bleed and page-geometry checks
@@ -28,7 +28,7 @@ DocStats is expected to grow from a statistics script into an InDesign productio
 
 ### EPUB checks
 
-- hyperlink destination validation
+- optional network validation of external hyperlink destinations after local syntax and classification checks
 - reading-order analysis against Articles panel and export settings
 - paragraph and object export-tag review
 - heading hierarchy analysis
@@ -58,6 +58,7 @@ Planned reporting work includes:
 - baseline comparison between document revisions
 - finding fingerprints so resolved/reintroduced conditions can be tracked
 - summary counts suitable for CI or publication release gates
+- optional external URL validation reports with response status and redirect-chain capture
 
 ## Architecture
 

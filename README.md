@@ -32,6 +32,12 @@ Each finding carries:
 - stable finding code
 - page number when InDesign exposes one
 - location label
+- object ID
+- object type
+- link/file name when applicable
+- frame label/name when applicable
+- geometric bounds when available
+- story/frame ID when applicable
 - finding title and detail
 - target object when available
 - optional guarded action
@@ -49,8 +55,12 @@ The **Locate** button pages to the affected location and selects the object when
 | DOC-003 | WARNING | Out-of-date linked asset | Update link |
 | DOC-004 | ERROR | Inaccessible URL link | Locate |
 | DOC-005 | INFO | Unrecognized link status | Locate |
-| DOC-006 | ERROR | Font unavailable | Manual review |
+| DOC-006A | ERROR | Unavailable font used by live text | Locate first detected live use |
+| DOC-006B | INFO | Unavailable font referenced but no live text use found | Manual review |
 | DOC-007 | WARNING | Document has no pages | Manual review |
+| HYP-001 | WARNING | Same hyperlink source text on one page has multiple destinations | Locate and review |
+| HYP-002 | INFO | Hyperlink uses HTTP rather than HTTPS | Locate and review |
+| HYP-003 | WARNING | URL ends with suspicious trailing punctuation | Locate and review |
 
 ### Print/PDF
 
@@ -58,7 +68,13 @@ The **Locate** button pages to the affected location and selects the object when
 |---|---|---|---|
 | PRINT-001 | WARNING | Bitmap below advisory effective-PPI threshold | Locate |
 
-The default advisory threshold is 200 PPI and can be changed in `MIN_PRINT_PPI` near the top of `DocStats.jsx`. Required resolution depends on the output process, line screen, source content, and viewing distance.
+Effective-PPI checks use an output-readiness profile rather than a single hard-coded threshold:
+
+- **General Health**: 200 PPI advisory threshold
+- **Print Production**: 300 PPI advisory threshold
+- **EPUB**: print effective-PPI check disabled
+
+The values are operational defaults defined in `PROFILES` near the top of `DocStats.jsx`. Required resolution depends on output process, line screen, source content, and viewing distance.
 
 ### EPUB
 
@@ -73,6 +89,20 @@ The default advisory threshold is 200 PPI and can be changed in `MIN_PRINT_PPI` 
 
 EPUB findings are pre-export review signals. A decorative image, fixed-layout EPUB, or intentionally layout-driven reading order can make a flagged condition acceptable.
 
+## Hyperlink analysis
+
+DocStats classifies InDesign hyperlinks separately from placed-file link status. Each hyperlink record carries direction, destination category, scheme, normalized domain, source form, page, source text or graphic, destination, repetition status, destination occurrence count, and the standard object-location fields.
+
+Top-level direction categories are:
+
+- **Internal**: page, text, paragraph, and fragment destinations
+- **External**: web URL, email, telephone, file URL, FTP, other URL, and external-document page destinations
+- **Unknown**: destination types or scan states that could not be resolved
+
+Source forms distinguish descriptive text, raw URLs, cross-reference text, page-item graphics, and inline graphics when the text source resolves to an anchored page item.
+
+The text report contains hyperlink totals, destination categories, schemes, source forms, repetition counts, and the top destination domains. The complete page-by-page inventory remains in the dedicated hyperlink CSV. DocStats also raises review findings for same-page source text that resolves to multiple destinations (`HYP-001`), HTTP destinations (`HYP-002`), and suspicious trailing URL punctuation (`HYP-003`).
+
 ## Statistics reported
 
 DocStats reports:
@@ -84,14 +114,15 @@ DocStats reports:
 - tables, footnotes, and endnotes
 - graphics and link states
 - fonts and style counts
-- hyperlinks, cross-reference sources, bookmarks, and Articles panel entries
+- hyperlinks by internal/external category, cross-reference sources, bookmarks, and Articles panel entries
 
 ## Reports
 
 The palette can save:
 
-- a UTF-8 text report containing statistics and findings
-- a CSV findings report with severity, scope, code, page, location, detail, and available action
+- a UTF-8 text report containing statistics, hyperlink summary, findings summary, and detailed findings
+- a CSV findings report with severity, scope, selected profile, code, page, object-location fields, detail, and available action
+- a CSV hyperlink inventory with direction, destination category, scheme, domain, source form, repetition metadata, page, source text or graphic, destination, and object-location fields
 
 ## Installation
 

@@ -7,6 +7,27 @@ DocStats is an Adobe InDesign document statistics, health, and output-readiness 
 
 The current implementation is an ExtendScript (`.jsx`) script for Adobe InDesign.
 
+## Safety posture
+
+**MODIFIES ON EXPLICIT SELECTION.**
+
+Scanning is read-only. DocStats never changes the document during a scan.
+
+Five guarded actions can modify the document, and only when the operator
+selects a finding and invokes the action:
+
+- update an out-of-date link
+- relink a missing asset to a file the operator chooses
+- write EPUB alternate text the operator enters
+- designate the first row of a table as a header row, after confirmation
+- write document title or author metadata the operator enters
+
+DocStats does not silently change layout, resize frames, substitute fonts,
+anchor objects, alter reading order, or rewrite export settings.
+
+Actions are not currently grouped for undo, and there is no automatic
+rollback. Work on a copy of any document you value.
+
 ## Current release
 
 **v1.1.0**
@@ -158,6 +179,30 @@ A future UXP implementation may use an `.idjs` or plugin architecture, but the E
 - [`docs/FINDINGS.md`](docs/FINDINGS.md): finding design, severity rules, and remediation policy
 - [`docs/ROADMAP.md`](docs/ROADMAP.md): planned expansion areas
 - [`CHANGELOG.md`](CHANGELOG.md): release history
+
+## The suite
+
+DocStats is the inventory and reporting member of the Localis InDesign tool
+suite. Each tool owns a defined region of the document and defers to its
+neighbors outside that region.
+
+| Tool | Purpose | Safety posture |
+|---|---|---|
+| [DocStats](https://github.com/johnwinstondarby/DocStats) | Document inventory, health, and output-readiness reporting | MODIFIES ON EXPLICIT SELECTION |
+| [StyleFix](https://github.com/johnwinstondarby/stylefix) | Unused and duplicate character style audit | READ-ONLY |
+| [HeaderFix](https://github.com/johnwinstondarby/HeaderFix) | Section header style auditing and correction | MODIFIES DOCUMENT-WIDE ON COMMAND |
+| [NormalFix](https://github.com/johnwinstondarby/NormalFix) | `Normal+` body paragraph auditing and correction | MODIFIES ON EXPLICIT SELECTION |
+| [TableFix](https://github.com/johnwinstondarby/TableFix) | Table header semantics and paragraph style normalization | MODIFIES ON EXPLICIT SELECTION |
+
+### Suite governance
+
+This repository is the canonical home for suite-wide governance until the
+`localis-indesign-tools` repository exists:
+
+- [Suite Harmonization Specification](SUITE_HARMONIZATION.md)
+
+These documents are single-copy. Other repositories link to them rather than
+carrying their own version.
 
 ## Status
 

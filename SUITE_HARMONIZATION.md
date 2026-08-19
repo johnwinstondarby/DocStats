@@ -94,13 +94,19 @@ transaction(label, targets, {
 })
 ```
 
-Two properties, both currently missing across the suite:
+Four tools mutate documents, not three. DocStats v1.1.0 carries five guarded actions: link update, relink, alternate-text entry, table header-row designation, and metadata entry. No tool in the suite currently groups undo or rolls back.
+
+Three properties, all currently missing across the suite:
 
 **Batch-level undo grouping.** The whole transaction runs inside `app.doScript` with `UndoModes.ENTIRE_SCRIPT` and the supplied label, so a batch is one undo step rather than dozens.
 
 **Per-item rollback.** A verification failure restores that item rather than leaving the document partly changed. NormalFix currently assigns the red character style, then applies the paragraph style, then verifies, and on failure returns "Could not verify" while leaving the character-style assignment in place. The document has been modified and the report does not say so.
 
+**Read-back verification as a required stage.** `verify` re-reads the changed property from the document rather than trusting the write. Two tools have independently produced the same silent-success defect: NormalFix reports "Could not verify" while leaving a change in place, and DocStats `setCustomAltText` writes `customAltText`, silently swallows a failure to set `altTextSourceType`, and returns success. In both cases the report claims a state the document does not have.
+
 TableFix already implements half of this pattern with its cell-fill snapshot and restore. Generalizing that instinct into the shared contract is most of the work.
+
+Highest-consequence action currently unguarded: DocStats `relinkAsset` replaces a placed asset with no confirmation beyond the file dialog, captures nothing about the original, and offers no restore.
 
 ### 3.6 `core/report`
 
@@ -140,13 +146,15 @@ Version constants, artifact parity check, measurement-unit normalization to poin
 
 Two shared registries, both living in the suite repository and read by the tools rather than restated in each README.
 
-**Code prefixes.** `DS-`, `HF-`, `NF-`, `TF-`, `SF-`. HeaderFix currently uses `H1-`, which reads as a reference to Heading 1 rather than to the tool. Renaming breaks continuity with existing CSVs, so it is a judgment call, but the suite reads more clearly if every prefix names its tool.
+**Code prefixes are not required to name their tool.** DocStats already publishes family-based codes (`DOC-`, `HYP-`, `PRINT-`, `EPUB-`) and its FINDINGS.md commits to keeping published codes stable. Requiring tool-named prefixes would break that for no benefit. The registry carries a Tool column instead, so a code's owner is recorded rather than encoded in its name. HeaderFix keeps `H1-`.
+
+Codes remain globally unique across the suite. A check whose meaning changes substantially receives a new code rather than being repurposed, and letter suffixes may identify stages of one check family, as with `DOC-006A` and `DOC-006B`.
 
 **Severity is one axis for all tools:** `ERROR`, `WARNING`, `INFO`, `PASS`.
 
 **Classification is a separate, tool-specific column.** StyleFix's LOW, MEDIUM, HIGH, and REPLACE are a risk classification, not a severity, and collapsing them into the severity axis would make the two incomparable across tools. TableFix's REVIEW is similarly a classification rather than a severity.
 
-`codes/CODES.csv` carries one row per code across the whole suite: code, tool, severity, meaning, remediable yes or no, and the ownership region it applies to.
+`codes/CODES.csv` carries one row per code across the whole suite: code, tool, family, severity, meaning, remediable yes or no, and the ownership region it applies to.
 
 ---
 
@@ -155,6 +163,8 @@ Two shared registries, both living in the suite repository and read by the tools
 The ownership boundary currently lives as prose in four separate READMEs, and the prose does not cover the whole document.
 
 One gap is already visible. NormalFix excludes every paragraph inside a table and defers to TableFix. TableFix refuses to remediate complex tables, which are those with merged or spanned cells or multiple header rows, marking them `TF-003` and never changing them. A `Normal+` paragraph inside a complex table is therefore excluded by NormalFix and declined by TableFix. It is owned by nobody, and nothing in either tool reports that condition.
+
+A second overlap is already in shipped code. TableFix owns tables and owns header-row semantics. DocStats `EPUB-004` remediates the same condition by setting `headerRowCount`, so two tools mutate one region under different verification standards. DocStats should report the condition and defer the change.
 
 `ownership/OWNERSHIP.md` becomes the single authority: a table of every document region, the tool that owns it, and what that tool does with it. Regions with no owner are listed explicitly as `UNOWNED` rather than being absent. Each tool README links to it instead of restating it, so the map cannot drift out of agreement with itself.
 
@@ -179,7 +189,11 @@ Applies to all five repositories.
 
 **Note on safety posture.** Writing this down forces an existing inconsistency into the open. NormalFix and TableFix both state that selection is the remediation boundary and that no document-wide Fix All exists. HeaderFix provides Fix All Errors and Clear All Overrides. The exception may be defensible, since the marker population is small and unambiguous, but three tools in one suite should not carry two safety postures by accident.
 
-**DocStats.** The repository contains a one-sentence README, no script, and one open pull request. In the ownership model DocStats is the inventory tool, and the style census StyleFix needs belongs there so that two tools do not count the same population independently. Whatever is in that pull request needs to land before anything can depend on it.
+**DocStats.** The repository holds a released v1.1.0 script of roughly 1,800 lines, a README, a CHANGELOG, and findings and roadmap documents. It is the most mature tool in the suite and the closest to this standard already: it has a CHANGELOG, uses the `ERROR` / `WARNING` / `INFO` severity axis, and documents its finding codes. It needs a LICENSE, a tag, a `.gitattributes`, an accurate safety-posture line, and CSV provenance.
+
+Its safety posture is `MODIFIES ON EXPLICIT SELECTION`, not `READ-ONLY`. Scanning is read-only; five guarded actions are not. Any statement to the contrary in a README or ownership document is a defect in the highest-consequence field of this standard and should be corrected on sight.
+
+In the ownership model DocStats is the inventory tool, and the style census StyleFix needs belongs there so that two tools do not count the same population independently.
 
 ---
 
@@ -187,13 +201,14 @@ Applies to all five repositories.
 
 Ordered so that the highest-risk condition clears first and no step depends on a later one.
 
-1. **`core/mutate` and its adoption by NormalFix.** Undo grouping and per-item rollback. This is the only item in the specification that addresses a condition capable of damaging the manuscript in its current state.
+1. **`core/mutate`, adopted by NormalFix and DocStats.** Undo grouping, per-item rollback, and read-back verification. This is the only step addressing conditions capable of damaging a document in the suite's current state. Within it, NormalFix's partial-mutation path and DocStats `relinkAsset` are the two highest-consequence items.
 2. **`core/color`.** The name-bypass and tint corrections. Adopted by NormalFix and TableFix together.
 3. **`core/text` and its adoption by HeaderFix.** Removes the last direct `applyParagraphStyle` call in the suite.
-4. **Suite repository, ownership map, code registry, build inliner.** Structural work with no behavioral change.
-5. **`core/report` and `core/ui`.** Provenance, CSV hardening, listbox, document guards.
-6. **Repository metadata across all repositories.** License, tags, changelog, actions, topics.
-7. **DocStats.** Land the open pull request, then build the census.
-8. **StyleFix adopts core.** After v1.0.8 passes its canary. The multi-module loader parity mechanism retires at this point, replaced by single-file distribution.
+4. **Ownership corrections.** DocStats `EPUB-004` reports rather than remediates. The unowned complex-table region gets an owner or an explicit `UNOWNED` entry.
+5. **Suite repository, ownership map, code registry, build inliner.** Structural work with no behavioral change.
+6. **`core/report` and `core/ui`.** Provenance, CSV BOM and control-character sanitization, listbox, and document rebinding. DocStats binds `app.activeDocument` once at load and never rebinds, so it can report against a document that is no longer active.
+7. **Repository metadata across all repositories.** License, tags, changelog, actions, topics.
+8. **DocStats census work.** Style census across all style classes, and an independent instance census. The instance census closes the `NO_APPLICABLE_INSTANCE` hole in StyleFix: a capability matrix claiming zero tables can be checked against an independent count rather than believed. Much of the counting already exists in the v1.1.0 statistics block.
+9. **StyleFix adopts core.** After v1.0.8 passes its canary. The multi-module loader parity mechanism retires at this point, replaced by single-file distribution.
 
-Steps 1 through 3 are defect corrections and should not wait on the structural work in step 4. The shared modules can begin life inside one tool and move to the suite repository when it exists.
+Steps 1 through 4 are defect corrections and should not wait on the structural work in step 5. The shared modules can begin life inside one tool and move to the suite repository when it exists.

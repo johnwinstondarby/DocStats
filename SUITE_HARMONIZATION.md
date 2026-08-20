@@ -360,7 +360,11 @@ The writer flushes:
 - after every `HARD_STOP` record,
 - after the final batch record.
 
-Normal completion also closes the file cleanly. A writer failure is recorded in memory and surfaced in the batch result. If the writer fails before mutation begins, mutation is `REFUSED` for the batch because the durability requirement is not satisfied. If the writer fails after mutation has begun, the batch halts after the current target reaches the safest provable state, and the operator message reports that durable journaling was lost.
+Normal completion also closes the file cleanly. A writer failure is recorded in memory and surfaced in the batch result.
+
+If the writer cannot initialize before target processing begins, the batch ends `HALTED` with `batchReason` `JOURNAL_UNAVAILABLE`; no mutation is attempted and every requested target ends `NOT_ATTEMPTED`. This is a batch preflight failure rather than an item-level `REFUSED` state.
+
+If the writer fails after mutation processing has begun, the current target is allowed to reach the safest provable item state that the engine can establish in memory. The batch then ends `HALTED` with `batchReason` `JOURNAL_FAILURE`, all later targets end `NOT_ATTEMPTED`, and the operator message states that durable journaling was lost. Journal loss by itself does not rewrite a proven `COMMITTED` or `ROLLED_BACK` item as `HARD_STOP`; `HARD_STOP` remains reserved for uncertain document state.
 
 `core/report` may later ingest or replace the presentation layer around these records, but the mutation engine's minimal durability path remains shared and portable.
 
@@ -395,15 +399,17 @@ The safety mechanism is proved independently before production integration.
 | T13 | Locator is stale before mutation begins | `SKIPPED` with `RESOLVE_FAILED`; batch continues and ends `COMPLETE` if no later hard stop occurs |
 | T14 | Precheck throws | `SKIPPED` with `PRECHECK_ERROR`; target unchanged; batch continues |
 | T15 | Target is eligible but snapshot reports rollback not ready | `REFUSED`; target unchanged; refusal counted and surfaced |
+| T16 | Durable journal cannot initialize before target processing | Batch `HALTED` with `JOURNAL_UNAVAILABLE`; all targets `NOT_ATTEMPTED`; no mutation occurs |
+| T17 | Durable journal fails after mutation processing begins | Current target retains its safest proven item state; batch `HALTED` with `JOURNAL_FAILURE`; later targets `NOT_ATTEMPTED` |
 
 The canary has two tiers:
 
-- **Synthetic tier:** T01 through T09 and T12 through T15. These exercise pure transaction logic with deterministic synthetic targets and require no open InDesign document.
+- **Synthetic tier:** T01 through T09 and T12 through T17. These exercise pure transaction logic with deterministic synthetic targets and require no open InDesign document.
 - **Real-DOM tier:** T10 and T11. These exercise InDesign Undo integrity and object invalidation against a real document because those behaviors cannot be proved by synthetic objects.
 
 T07 is mandatory. It proves that rollback verification is independent from the snapshot and that declared digest coverage can detect residue intentionally excluded from restoration.
 
-T09 also verifies deterministic ordering. T13 pins the pre-mutation resolve-failure rule. T14 distinguishes a precheck exception from a normal decline. T15 ensures a safety refusal cannot disappear into the `SKIPPED` count.
+T09 also verifies deterministic ordering. T13 pins the pre-mutation resolve-failure rule. T14 distinguishes a precheck exception from a normal decline. T15 ensures a safety refusal cannot disappear into the `SKIPPED` count. T16 and T17 pin durable-journal failure semantics without conflating reporting loss with uncertain document state.
 
 #### Adoption order within `core/mutate`
 

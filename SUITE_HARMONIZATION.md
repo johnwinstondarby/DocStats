@@ -86,9 +86,9 @@ The mutation transaction. Every change to a document in every tool passes throug
 
 #### Current implementation status
 
-**Running update: 2026-08-19.** The v1 design decisions below are accepted for the shared transaction component. NormalFix is the first proving ground because its current partial-mutation path is compact and already demonstrates the failure class `core/mutate` is intended to eliminate. The mutation canary is built and passed before NormalFix depends on the component. DocStats is the second adopter, beginning with the higher-consequence `relinkAsset` path. TableFix and HeaderFix follow where they mutate document state. StyleFix remains deferred until its v1.0.8 canary work is complete.
+**Running update: 2026-08-19. Contract status: FROZEN.** The `core/mutate` v1 contract below is frozen for implementation. NormalFix is the first proving ground because its current partial-mutation path is compact and already demonstrates the failure class `core/mutate` is intended to eliminate. The mutation canary is built and passed before NormalFix depends on the component. DocStats is the second adopter, beginning with the higher-consequence `relinkAsset` path. TableFix and HeaderFix follow where they mutate document state. StyleFix remains deferred until its v1.0.8 canary work is complete.
 
-No production tool has adopted `core/mutate` yet. The current work is the portable contract and its independent canary.
+No production tool has adopted `core/mutate` yet. Implementation now proceeds against this frozen contract and its independent canary. A later contract change requires either an observed safety or correctness defect, or an explicit versioned revision of the contract. Refinement alone does not reopen v1.
 
 #### Portable transaction boundary
 
@@ -102,8 +102,8 @@ transaction(label, targets, {
     resolve,          // re-acquire the target from its stable locator
     precheck,         // re-verify eligibility immediately before the change
     snapshot,         // capture the state required for explicit restoration
-    digestCoverage,   // declare the reviewable property set proved by rollbackDigest
-    rollbackDigest,   // capture the independent proof signature
+    digestCoverage,   // declare the exact reviewable key set proved by rollbackDigest
+    rollbackDigest,   // return the keyed independent proof structure
     mutate,           // perform the requested change
     verify,           // read the changed state back from the document
     rollback          // restore the captured state
@@ -116,7 +116,11 @@ The shared engine owns ordering, sequencing, undo grouping, state assignment, ha
 
 Batch ordering is deterministic. `core/mutate` sorts a copy of the requested target locators through the adapter's `compareLocators()` function before processing begins.
 
-The comparator must be stable for the same target set and appropriate to the adapter's mutation behavior. A text-changing adapter, for example, may need reverse offset order within a story so an earlier mutation does not shift the coordinates of a later target. NormalFix does not change text length, but its adapter still declares a deterministic order.
+The comparator must be stable for the same target set. Deterministic ordering exists for reproducibility, journal comparability, and predictable `NOT_ATTEMPTED` sets. It is not the correctness mechanism for target identity.
+
+Stable locators plus stage-by-stage re-resolution carry the correctness guarantee. If an adapter requires a particular order to keep its locators valid, those locators are not stable enough for the `core/mutate` contract and the adapter must redesign its locator strategy before adoption.
+
+NormalFix does not change text length, but its adapter still declares a deterministic order.
 
 The journal records both request count and processing ordinal. After a hard stop, the resulting `NOT_ATTEMPTED` set must be reproducible for the same ordered target set.
 
@@ -155,9 +159,9 @@ A target that is eligible for change but is not rollback-ready does not mutate. 
 
 #### Snapshot, digest, and declared digest coverage
 
-The snapshot exists to restore. The rollback digest exists to prove restoration. The digest coverage declaration defines the boundary of that proof.
+The snapshot exists to restore. The rollback digest exists to prove restoration. The digest coverage declaration defines the exact boundary of that proof.
 
-Every adapter publishes a human-reviewable `digestCoverage()` result that names the properties or state dimensions included in `rollbackDigest()`. The declaration is journaled with the adapter/version identity and is part of code review for the adapter.
+Every adapter publishes a human-reviewable `digestCoverage()` result naming the exact keys that `rollbackDigest()` must return. The declaration is journaled with the adapter/version identity and is part of code review for the adapter.
 
 Example:
 
@@ -171,21 +175,51 @@ digestCoverage: function () {
         "contents",
         "redPositions"
     ];
+},
+
+rollbackDigest: function (target) {
+    return {
+        appliedParagraphStyle: ...,
+        paragraphOverrides: ...,
+        characterStyleRuns: ...,
+        localCharacterFormatting: ...,
+        contents: ...,
+        redPositions: ...
+    };
 }
 ```
 
-`rollbackDigest()` must be derived independently from the snapshot property list. Reusing the snapshot fields for rollback verification creates a circular test: an uncaptured property would also be absent from the proof and could remain changed without detection.
+The engine enforces the declaration. For every digest capture, it compares the sorted key set returned by `rollbackDigest()` with the sorted key set declared by `digestCoverage()`. Missing keys, extra keys, duplicate declaration keys, or a non-keyed digest are adapter-contract failures.
 
-Independence alone is insufficient. A digest can be independently computed and still cover too little. The declared coverage therefore serves two purposes:
+A digest/key mismatch detected before any mutation begins ends the batch `HALTED` with `batchReason` `ADAPTER_CONTRACT_MISMATCH`; no mutation occurs and all requested targets end `NOT_ATTEMPTED`. A mismatch discovered on a later target before that target's `mutate()` invocation ends the batch the same way; the current and later targets are `NOT_ATTEMPTED`, while earlier proven item states remain unchanged.
 
-1. It makes the rollback proof boundary inspectable before deployment.
-2. It makes the meaning of `ROLLED_BACK` precise.
+`rollbackDigest()` must also be derived independently from the snapshot property list. Reusing the snapshot fields for rollback verification creates a circular test: an uncaptured property would also be absent from the proof and could remain changed without detection.
 
-The transaction engine captures the digest before mutation and captures it again after rollback. The two digests must match across the declared coverage.
+Independence alone is insufficient. The exact-key assertion makes the declaration executable rather than documentary.
+
+The transaction engine captures the keyed digest before mutation and again after rollback. The two keyed structures must match across the declared coverage.
 
 Properties outside both the snapshot and declared digest coverage are outside the `ROLLED_BACK` proof by definition. The contract does not imply otherwise.
 
-T07 deliberately changes a property absent from the snapshot but present in the declared digest coverage. Rollback restores the captured fields, and the independent digest must detect the residue and force a hard stop. A canary that allows this case to pass has not proved the rollback layer.
+##### Inapplicable dimensions are read results
+
+Every declared digest key is always emitted. When a declared dimension has no state for a target, `rollbackDigest()` returns the shared sentinel `Mutate.NOT_APPLICABLE` for that key.
+
+`Mutate.NOT_APPLICABLE` must be the result of reading the declared dimension and finding no state there. An adapter must not determine applicability through a separate predicate that bypasses the dimension read. A separate applicability test can repeat the same mistake before and after rollback and hide residue.
+
+The required pattern is conceptually:
+
+```javascript
+readDimension(target)
+// returns canonical value when state exists
+// returns Mutate.NOT_APPLICABLE when the read finds no state
+```
+
+A mutation that creates state in a formerly empty dimension must therefore change that digest key from `Mutate.NOT_APPLICABLE` to a value. Rollback verification then detects any failure to remove the new state.
+
+T07 deliberately changes a property absent from the snapshot but present in the declared digest coverage. Rollback restores the captured fields, and the independent digest must detect the residue and force a hard stop.
+
+A separate coverage-boundary canary deliberately changes a property absent from both the snapshot and declared digest coverage. That case is allowed to end `ROLLED_BACK` even though residue remains, proving the bounded nature of the guarantee rather than implying total equivalence.
 
 #### Batch Undo and per-item rollback
 
@@ -221,17 +255,25 @@ RESOLVE
    +-- fail before mutate invoked --> SKIPPED / RESOLVE_FAILED / continue
    |
 PRECHECK
-   +-- decline --> SKIPPED / continue
+   +-- decline --> SKIPPED / PRECHECK_DECLINED / continue
    +-- throw   --> SKIPPED / PRECHECK_ERROR / continue
    |
 SNAPSHOT
+   +-- throw   --> SKIPPED / SNAPSHOT_ERROR / continue
    |
 ROLLBACK-READINESS CHECK
-   +-- not ready --> REFUSED / continue
+   +-- not ready --> REFUSED / ROLLBACK_NOT_READY / continue
    |
-DECLARE + CAPTURE PRE-MUTATION DIGEST COVERAGE
+DECLARE DIGEST COVERAGE
+   |
+CAPTURE PRE-MUTATION KEYED DIGEST
+   +-- throw --> SKIPPED / DIGEST_ERROR / continue
+   +-- key mismatch --> HALTED / ADAPTER_CONTRACT_MISMATCH
    |
 MUTATE INVOKED
+   |
+RE-ACQUIRE FOR VERIFY
+   +-- fail --> HARD_STOP
    |
 VERIFY BY READ-BACK
    +-- pass --> COMMITTED
@@ -242,11 +284,12 @@ VERIFY BY READ-BACK
           |
        RE-ACQUIRE TARGET
           |
-       POST-ROLLBACK DIGEST OVER DECLARED COVERAGE
+       POST-ROLLBACK KEYED DIGEST
           |
           +-- digest matches --> ROLLED_BACK / continue
           |
           +-- rollback throws, target cannot be resolved,
+              digest capture fails, key set mismatches,
               or digest differs --> HARD_STOP
                                       |
                                       +-- halt batch
@@ -261,7 +304,7 @@ Every requested target ends in exactly one item state:
 | State | Meaning |
 |---|---|
 | `COMMITTED` | Mutation applied and read-back verification passed. |
-| `SKIPPED` | No mutation was attempted because the target no longer resolved, precheck declined, or precheck errored. The document is unchanged for that target. |
+| `SKIPPED` | No mutation was attempted because the target no longer resolved, precheck declined, precheck errored, snapshot capture errored, or pre-mutation digest capture errored. The document is unchanged for that target. |
 | `REFUSED` | The target was eligible for mutation, but a safety requirement such as rollback readiness was not satisfied. The document is unchanged for that target and the refusal is surfaced to the operator. |
 | `ROLLED_BACK` | Mutation was attempted, restoration ran, and the independent post-rollback digest matched the pre-mutation digest across the adapter's declared digest coverage. |
 | `HARD_STOP` | Mutation may have occurred and restoration failed, the post-mutation target could not be re-acquired, or restoration could not be proved across the declared digest coverage. State for that item is uncertain within the bounds of the transaction contract. |
@@ -272,13 +315,15 @@ A mutation batch ends in exactly one batch state:
 - `COMPLETE`
 - `HALTED`
 
-The journal records `reasonCode` and `failureStage` separately from the final state. Examples include `PRECHECK_DECLINED`, `PRECHECK_ERROR`, `ROLLBACK_NOT_READY`, `MUTATE_ERROR`, `VERIFY_FAILED`, `ROLLBACK_ERROR`, and `ROLLBACK_DIGEST_MISMATCH`.
+The journal records `reasonCode` and `failureStage` separately from the final state. Examples include `RESOLVE_FAILED`, `PRECHECK_DECLINED`, `PRECHECK_ERROR`, `SNAPSHOT_ERROR`, `DIGEST_ERROR`, `ROLLBACK_NOT_READY`, `ADAPTER_CONTRACT_MISMATCH`, `MUTATE_ERROR`, `VERIFY_FAILED`, `VERIFY_ERROR`, `ROLLBACK_ERROR`, and `ROLLBACK_DIGEST_MISMATCH`.
 
 `HARD_STOP` always halts the batch.
 
 #### Read-back verification is required
 
 `verify()` re-acquires the target and reads the changed state from the document. It never infers success from the absence of an exception or from the value that was written.
+
+A verification result of false or mismatch records `VERIFY_FAILED`. An exception raised while executing the verification logic records `VERIFY_ERROR`. Both enter the rollback path, but the journal preserves the distinction between a mutation that did not verify and verification code that failed to execute.
 
 This closes two existing silent-success paths. NormalFix can currently report "Could not verify" after leaving a character-style assignment in place, and DocStats `setCustomAltText` can return success after `customAltText` is written even when `altTextSourceType` did not change as required.
 
@@ -298,9 +343,15 @@ The outer InDesign Undo remains the full-command backstop. The real-DOM canary v
 
 #### Dry-run mode
 
-`core/mutate` supports a dry-run execution mode for adapters that can plan safely without writing. Dry run performs deterministic ordering, target resolution, precheck, snapshot-readiness assessment, digest-coverage declaration, and the verification plan while suppressing mutation and rollback.
+`core/mutate` supports a dry-run execution mode for adapters that can plan safely without writing.
 
-Dry-run results are planning results and do not use the mutation final-state taxonomy above. This keeps `COMMITTED`, `REFUSED`, `ROLLED_BACK`, and related mutation states tied to real command execution.
+Dry run executes only the planning stages: deterministic ordering, target resolution, precheck, snapshot/readiness assessment, digest-coverage declaration, and pre-mutation digest/key validation. It must not invoke `mutate()`, `verify()`, or `rollback()`.
+
+Dry-run output uses planning results rather than the mutation final-state taxonomy. The journal records `executionMode: DRY_RUN` and planning outcomes only. No record may state `mutationAttempted: true`, `rollbackAttempted: true`, `COMMITTED`, `ROLLED_BACK`, or `HARD_STOP`.
+
+A dry-run target that reveals a pre-mutation condition which would prevent safe live execution reports that risk as a planning finding. It does not enter live rollback handling. Dry run does not claim to predict failures that can only be discovered after a real write.
+
+The canary contains two binding dry-run cases: one batch that would otherwise commit, proving zero mutation and zero mutation journal records; and one batch containing a target with a planning-visible condition that would halt live execution, such as an adapter digest-key mismatch, proving that dry run reports the risk without invoking mutation, verification, or rollback.
 
 #### Transaction journal
 
@@ -311,6 +362,8 @@ batch ID
 processing ordinal
 target locator
 adapter identity/version
+last conformance version
+last conformance date
 digest coverage declaration
 resolve result
 precheck result
@@ -364,7 +417,9 @@ Normal completion also closes the file cleanly. A writer failure is recorded in 
 
 If the writer cannot initialize before target processing begins, the batch ends `HALTED` with `batchReason` `JOURNAL_UNAVAILABLE`; no mutation is attempted and every requested target ends `NOT_ATTEMPTED`. This is a batch preflight failure rather than an item-level `REFUSED` state.
 
-If the writer fails after mutation processing has begun, the current target is allowed to reach the safest provable item state that the engine can establish in memory. The batch then ends `HALTED` with `batchReason` `JOURNAL_FAILURE`, all later targets end `NOT_ATTEMPTED`, and the operator message states that durable journaling was lost. Journal loss by itself does not rewrite a proven `COMMITTED` or `ROLLED_BACK` item as `HARD_STOP`; `HARD_STOP` remains reserved for uncertain document state.
+If the writer fails after mutation processing has begun, journal failure does not abort the current target mid-proof. The engine completes verification or, when verification fails, completes rollback and rollback verification for that target in memory. The current target then takes its proven final item state. Only after that proof completes does the batch end `HALTED` with `batchReason` `JOURNAL_FAILURE`; all later targets end `NOT_ATTEMPTED`, and the operator message states that durable journaling was lost.
+
+If the engine cannot complete verification or rollback proof for the current target, that target ends `HARD_STOP` for the document-state reason. Journal loss by itself never rewrites a proven `COMMITTED` or `ROLLED_BACK` item as `HARD_STOP`.
 
 `core/report` may later ingest or replace the presentation layer around these records, but the mutation engine's minimal durability path remains shared and portable.
 
@@ -396,31 +451,88 @@ The safety mechanism is proved independently before production integration.
 | T10 | Full real-DOM canary batch followed by one InDesign Undo | Canary-document digest matches pre-batch digest across declared fixture coverage |
 | T11 | Mutation invalidates the original target reference | Re-acquisition succeeds and verification still runs |
 | T12 | Re-run against already-correct targets | Targets decline through precheck; no second mutation |
-| T13 | Locator is stale before mutation begins | `SKIPPED` with `RESOLVE_FAILED`; batch continues and ends `COMPLETE` if no later hard stop occurs |
+| T13 | Locator is stale before mutation begins | `SKIPPED` with `RESOLVE_FAILED`; batch continues |
 | T14 | Precheck throws | `SKIPPED` with `PRECHECK_ERROR`; target unchanged; batch continues |
 | T15 | Target is eligible but snapshot reports rollback not ready | `REFUSED`; target unchanged; refusal counted and surfaced |
 | T16 | Durable journal cannot initialize before target processing | Batch `HALTED` with `JOURNAL_UNAVAILABLE`; all targets `NOT_ATTEMPTED`; no mutation occurs |
-| T17 | Durable journal fails after mutation processing begins | Current target retains its safest proven item state; batch `HALTED` with `JOURNAL_FAILURE`; later targets `NOT_ATTEMPTED` |
+| T17 | Durable journal fails after mutation processing begins | Current target completes verification or rollback proof before batch halt; later targets `NOT_ATTEMPTED` |
+| T18 | `rollbackDigest()` key set differs from `digestCoverage()` | Batch `HALTED` with `ADAPTER_CONTRACT_MISMATCH`; current and later targets `NOT_ATTEMPTED`; earlier proven item states preserved |
+| T19 | Dry run over a batch that would otherwise commit | Planning results only; zero mutation, verify, rollback calls, and zero document change |
+| T20 | Dry run includes a target with a planning-visible condition that would halt live execution, such as digest-key mismatch | Risk reported as planning output; no mutation, verification, or rollback handling |
+| T21 | `snapshot()` throws before mutation | `SKIPPED` with `SNAPSHOT_ERROR`; target unchanged; batch continues |
+| T22 | Pre-mutation digest capture throws | `SKIPPED` with `DIGEST_ERROR`; target unchanged; batch continues |
+| T23 | Mutation changes a property absent from both snapshot and declared digest coverage, then rollback is forced | `ROLLED_BACK` may pass while residue remains; test demonstrates the explicit proof boundary |
+| T24 | `compareLocators()` throws during batch preflight | Batch `HALTED` with `ADAPTER_CONTRACT_MISMATCH`; all targets `NOT_ATTEMPTED`; no mutation occurs |
+| T25 | Comparator produces inconsistent ordering under validation | Batch `HALTED` with `ADAPTER_CONTRACT_MISMATCH`; all targets `NOT_ATTEMPTED`; no mutation occurs |
+| T26 | `verify()` throws after mutation | `VERIFY_ERROR`; rollback runs and reaches `ROLLED_BACK` if restoration proves clean |
+| T27 | `verify()` returns false or mismatch after mutation | `VERIFY_FAILED`; rollback runs and reaches `ROLLED_BACK` if restoration proves clean |
 
 The canary has two tiers:
 
-- **Synthetic tier:** T01 through T09 and T12 through T17. These exercise pure transaction logic with deterministic synthetic targets and require no open InDesign document.
+- **Synthetic tier:** T01 through T09 and T12 through T27. These exercise pure transaction logic with deterministic synthetic targets and require no open InDesign document.
 - **Real-DOM tier:** T10 and T11. These exercise InDesign Undo integrity and object invalidation against a real document because those behaviors cannot be proved by synthetic objects.
 
-T07 is mandatory. It proves that rollback verification is independent from the snapshot and that declared digest coverage can detect residue intentionally excluded from restoration.
+T07 proves that rollback verification can detect residue intentionally excluded from restoration but included in declared proof coverage. T18 proves the declared coverage cannot drift from the keyed digest implementation. T19 and T20 prove dry-run suppression. T21 and T22 pin the remaining pre-mutation exception paths. T23 deliberately passes with out-of-coverage residue so the bounded nature of `ROLLED_BACK` is executable rather than merely documented.
 
-T09 also verifies deterministic ordering. T13 pins the pre-mutation resolve-failure rule. T14 distinguishes a precheck exception from a normal decline. T15 ensures a safety refusal cannot disappear into the `SKIPPED` count. T16 and T17 pin durable-journal failure semantics without conflating reporting loss with uncertain document state.
+T09 also verifies deterministic ordering. T13 pins the pre-mutation resolve-failure rule. T14 distinguishes a precheck exception from a normal decline. T15 ensures a safety refusal cannot disappear into the `SKIPPED` count. T16 and T17 pin durable-journal failure semantics without conflating reporting loss with uncertain document state. T24 and T25 guard comparator preflight. T26 and T27 distinguish verification-code failure from a legitimate verification mismatch.
+
+#### Adapter conformance gate
+
+The engine can enforce transaction behavior, but snapshot fidelity, locator stability, digest provenance, rollback implementation, and precheck correctness are adapter-owned. Every production adapter therefore passes a real-DOM conformance suite before adoption.
+
+Each adapter declares:
+
+```text
+adapterVersion
+lastConformanceVersion
+lastConformanceDate
+```
+
+Before any live mutation batch begins, `core/mutate` requires:
+
+```text
+adapterVersion == lastConformanceVersion
+```
+
+A mismatch ends the batch `HALTED` with `batchReason` `ADAPTER_CONFORMANCE_STALE`; no mutation occurs and all requested targets end `NOT_ATTEMPTED`.
+
+The mutation journal records the adapter version, last conformance version, and last conformance date so a later report can prove that the exact running adapter version had a current conformance pass.
+
+Any change to locator behavior, snapshot contents, rollback behavior, digest coverage, digest computation, precheck behavior, or mutation behavior requires an adapter version increment and a new conformance pass before live mutation is permitted.
+
+The minimum conformance suite is:
+
+| ID | Case | Required proof |
+|---|---|---|
+| `AC01` | Locator stability | A benign document edit occurs between discovery and execution; the locator re-resolves the intended live target correctly. |
+| `AC02` | Digest provenance | Each declared digest dimension is changed directly in the live DOM where expressible; the corresponding digest key changes. Digest values must come from document reads rather than snapshot reuse. |
+| `AC03` | Live rollback | Verification failure is injected only to enter the rollback path. The production adapter's real snapshot, rollback, target re-resolution, digest capture, and rollback verification implementations run unchanged and restore the live target across declared coverage. |
+| `AC04` | Idempotent precheck | An already-correct live target is declined by precheck and no mutation occurs. |
+| `AC05` | Inapplicable dimension | A live target lacks state for a declared digest dimension; the adapter still emits that key as `Mutate.NOT_APPLICABLE` from the dimension read. Creating state in that dimension changes the key from the sentinel to a value. |
+
+AC03 must not substitute a simulated rollback implementation. The injected verification failure is only the trigger that enters the production rollback path.
+
+Adapter conformance is a release gate, not a one-time certification. A conformance result applies only to the exact `adapterVersion` that passed it.
+
+#### Comparator preflight
+
+`compareLocators()` runs before target processing and is an adapter contract surface. The engine guards comparator execution and validates deterministic output before opening the mutation path.
+
+A comparator exception, invalid comparison result, or detected inconsistent ordering ends the batch `HALTED` with `batchReason` `ADAPTER_CONTRACT_MISMATCH`; no mutation occurs and all requested targets end `NOT_ATTEMPTED`.
+
+Comparator validation must at minimum confirm that the same copied locator set sorted repeatedly under the comparator yields the same serialized locator order. This does not constitute a mathematical proof of comparator transitivity, but it makes nondeterminism observable and keeps comparator failure in batch preflight rather than inside document mutation.
 
 #### Adoption order within `core/mutate`
 
-1. Freeze the portable contract, including declared digest coverage and normal-return hard-stop behavior.
-2. Build and pass the synthetic mutation canary.
+1. **FROZEN 2026-08-19:** portable `core/mutate` v1 contract.
+2. Build and pass the synthetic mutation canary, including T18 through T27.
 3. Build and pass the real-DOM mutation canary.
-4. Integrate the NormalFix mutation adapter.
+4. Implement the NormalFix mutation adapter.
 5. Publish NormalFix snapshot coverage and digest coverage as part of the adapter review.
-6. Verify NormalFix repair, refusal, rollback, hard-stop, durable journal, deterministic ordering, and one-step Undo behavior.
-7. Integrate DocStats, beginning with `relinkAsset`.
-8. Extend the same contract to remaining mutation paths without introducing tool-specific transaction forks.
+6. Run and pass NormalFix adapter conformance AC01 through AC05; record `adapterVersion`, `lastConformanceVersion`, and `lastConformanceDate`.
+7. Verify NormalFix repair, refusal, rollback, hard-stop, durable journal, deterministic ordering, and one-step Undo behavior.
+8. Integrate DocStats, beginning with `relinkAsset`, under the same adapter-conformance gate.
+9. Extend the same contract to remaining mutation paths without introducing tool-specific transaction forks.
 
 TableFix already implements part of the snapshot-and-restore pattern for cell fills. That prior behavior is useful input, but the shared contract above governs future adoption.
 

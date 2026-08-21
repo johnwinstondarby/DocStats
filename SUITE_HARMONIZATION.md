@@ -151,7 +151,7 @@ Version constants, artifact parity check, measurement-unit normalization to poin
 
 ScriptWatch is horizontal suite infrastructure. It observes DocStats, HeaderFix, NormalFix, TableFix, StyleFix when adopted, and future tools through two independent acquisition paths.
 
-**Agentless acquisition.** `scriptwatch.py` and `scriptwatch_web.py` observe the InDesign process and host from outside InDesign. This path requires no modification to the observed script and remains available when a script publishes no heartbeat. Process CPU, private memory, working set, threads, handles, process uptime, host physical-memory use, and host commit data belong to this path.
+**Agentless acquisition.** `scriptwatch.py` observes the InDesign process and host from outside InDesign and writes the canonical telemetry CSV. This path requires no modification to the observed script and remains available when a script publishes no heartbeat. The v1 collector surface includes process CPU, private memory, working set, threads, handles, cumulative read/write/other I/O bytes and operations, page faults, Windows GDI and USER object counts when available, process uptime, host physical-memory use, system commit charge, system cache, kernel paged/nonpaged pools, and system process/thread/handle counts. Unsupported counters remain unavailable rather than being assigned a different meaning. `scriptwatch_web.py` consumes the collector snapshot and does not maintain a second host-memory sampler.
 
 **Harness acquisition.** The ScriptWatch Harness is the reusable code part a script includes when it wants the ScriptWatch console to understand the work inside the process. The canonical source components live in the ScriptWatch repository and are included in this order:
 
@@ -162,18 +162,24 @@ ScriptWatch is horizontal suite infrastructure. It observes DocStats, HeaderFix,
 
 `ScriptWatchHeartbeat.jsxinc` owns the fail-isolated heartbeat transport. `ScriptWatchJob.jsxinc` owns the shared job contract and is the preferred adoption point for suite tools. Observation failure must never stop the tool. If the heartbeat transport is absent or unavailable, Harness calls degrade to no-op observation while tool work continues.
 
+**Current contract:** ScriptWatch Harness 1.2 and heartbeat schema 1.2. Harness 1.2 publishes structured `tool`, `toolVersion`, `harnessVersion`, `mode`, and heartbeat `schemaVersion` fields in addition to the human-readable `<tool> · harness <version>` note prefix. The collector persists those fields directly in CSV so provenance does not depend on parsing display text.
+
 The Harness provides two execution shapes:
 
 - `ScriptWatchJob.run()` for collection-driven work where one outer-loop target is the ETA unit.
-- `ScriptWatchJob.begin()` for phase-driven work where the tool advances through named stages rather than a target collection.
+- `ScriptWatchJob.begin()` for phase-driven work where the tool advances through named stages rather than a target collection or where another subsystem already owns sequencing.
 
 The shared Harness contract standardizes target progress, PASS/FAIL counts, checkpoint cadence, notes, terminal state, and Harness version provenance. `false` and thrown errors report FAIL; any other return reports PASS. A failing target continues by default. `continueOnError: false` converts the first failure into an `ABORTED` terminal state and rethrows to the caller. Terminal publication occurs in `finally` so a completed or aborted tool does not leave a live RUNNING heartbeat behind.
 
-The Harness publishes `<tool> · harness <version>` in the heartbeat note. ScriptWatch persists that note into runtime CSV data so later analysis can identify the exact Harness contract used by a run. Harness version changes are deliberate contract revisions rather than incidental source edits.
+**Custom metrics.** Harness 1.2 provides `session.metric(name, value, opts)` for bounded domain telemetry that ScriptWatch cannot know generically. A job may publish up to 32 current finite numeric metrics. Metadata may include `unit`, `min`, `max`, `note`, and `display` (`counter`, `dial`, or `trend`). Unsupported display values normalize to `counter`. The heartbeat and CSV retain the metadata. The current dashboard renders custom metrics as number-in-box counters; richer presentation can use the existing metadata without changing the producer contract. This channel prevents tool-specific counters from expanding or redefining the fixed process/host telemetry schema.
 
-**Integration boundary with `core/mutate`.** ScriptWatch observes work; `core/mutate` owns document mutation safety. Harness progress, checkpoints, notes, and status must not replace target re-resolution, precheck, snapshot, digest coverage, verification, rollback, durable mutation journaling, or batch hard-stop semantics. A mutation tool whose loop is owned by `core/mutate` uses the phase/session Harness form or an explicit reporting bridge rather than creating a second competing target loop.
+**Persistent-engine boundary.** Each heartbeat `start()` resets prior metrics, counters, notes, timing, and lock state so a persistent ExtendScript engine cannot carry one job's observability state into the next job.
 
-**Third-party integration.** A script outside the suite can become ScriptWatch-aware by adding the two Harness code parts and describing its work through `run()` or `begin()`. The external observer remains useful without that integration, but only Harness-enabled scripts can publish semantic job data such as target count, PASS/FAIL, checkpoint, phase notes, and terminal state.
+**Integration boundary with `core/mutate`.** ScriptWatch observes work; `core/mutate` owns document mutation safety. Harness progress, checkpoints, notes, status, and custom metrics must not replace target re-resolution, precheck, snapshot, digest coverage, verification, rollback, durable mutation journaling, or batch hard-stop semantics. A mutation tool whose loop is owned by `core/mutate` uses the phase/session Harness form or an explicit reporting bridge rather than creating a second competing target loop.
+
+**Third-party integration.** A script outside the suite can become ScriptWatch-aware by adding the two Harness code parts and describing its work through `run()` or `begin()`. The external observer remains useful without that integration, but only Harness-enabled scripts can publish semantic job data such as target count, PASS/FAIL, checkpoint, phase notes, terminal state, structured provenance, and custom domain metrics.
+
+**Contract canaries.** ScriptWatch carries dependency-free collector, dashboard-contract, Harness, and heartbeat canaries. They pin stale-terminal discovery, CSV column uniqueness, stable host-counter schema, legacy CSV report compatibility, structured provenance, custom metric forwarding/serialization, fail-fast terminal behavior, lock release, and persistent-engine reset behavior before a suite tool adopts the Harness.
 
 ---
 
@@ -237,7 +243,7 @@ In the ownership model DocStats is the inventory tool, and the style census Styl
 
 Ordered so that the highest-risk condition clears first and no step depends on a later one.
 
-**ScriptWatch Harness adoption is horizontal rather than a numbered dependency.** Suite tools add the Harness as their current canary/release work permits. Because ScriptWatch observation is fail-isolated and does not own mutation semantics, Harness adoption may proceed in parallel with the steps below and must not delay `core/mutate` safety work. New suite tools include the Harness from their first instrumented build.
+**ScriptWatch Harness adoption is horizontal rather than a numbered dependency.** Suite tools add the Harness as their current canary/release work permits. Because ScriptWatch observation is fail-isolated and does not own mutation semantics, Harness adoption may proceed in parallel with the steps below and must not delay `core/mutate` safety work. New suite tools include the Harness from their first instrumented build. Harness adoption uses the current pinned contract and passes ScriptWatch's contract canaries before release.
 
 1. **`core/mutate`, adopted by NormalFix and DocStats.** Undo grouping, per-item rollback, and read-back verification. This is the only step addressing conditions capable of damaging a document in the suite's current state. Within it, NormalFix's partial-mutation path and DocStats `relinkAsset` are the two highest-consequence items.
 2. **`core/color`.** The name-bypass and tint corrections. Adopted by NormalFix and TableFix together.

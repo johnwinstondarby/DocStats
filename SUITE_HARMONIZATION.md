@@ -245,7 +245,9 @@ Ordered so that the highest-risk condition clears first and no step depends on a
 
 **ScriptWatch Harness adoption is horizontal rather than a numbered dependency.** Suite tools add the Harness as their current canary/release work permits. Because ScriptWatch observation is fail-isolated and does not own mutation semantics, Harness adoption may proceed in parallel with the steps below and must not delay `core/mutate` safety work. New suite tools include the Harness from their first instrumented build. Harness adoption uses the current pinned contract and passes ScriptWatch's contract canaries before release.
 
-1. **`core/mutate`, adopted by NormalFix and DocStats.** Undo grouping, per-item rollback, and read-back verification. This is the only step addressing conditions capable of damaging a document in the suite's current state. Within it, NormalFix's partial-mutation path and DocStats `relinkAsset` are the two highest-consequence items.
+**Production-discrimination precondition.** NormalFix's August 21, 2026 production sweep established a new prerequisite for NormalFix's mutation-adapter work: the host-object identity defect and the production `frameSpanSignature` failure are diagnosed and pass the production-discrimination gates in section 8 before NormalFix advances from read-only proof into production `core/mutate` adoption. ScriptWatch Harness is intentionally absent from the bare diagnostic canary and enters on the first 20-to-50-target post-fix production rerun. This keeps diagnosis and instrumentation adoption as separate variables.
+
+1. **`core/mutate`, adopted by NormalFix and DocStats.** Undo grouping, per-item rollback, and read-back verification. This is the only step addressing conditions capable of damaging a document in the suite's current state. Within it, NormalFix's partial-mutation path and DocStats `relinkAsset` are the two highest-consequence items. NormalFix enters this step only after its section 8 production-discrimination precondition passes.
 2. **`core/color`.** The name-bypass and tint corrections. Adopted by NormalFix and TableFix together.
 3. **`core/text` and its adoption by HeaderFix.** Removes the last direct `applyParagraphStyle` call in the suite.
 4. **Ownership corrections.** DocStats `EPUB-004` reports rather than remediates. The unowned complex-table region gets an owner or an explicit `UNOWNED` entry.
@@ -253,6 +255,92 @@ Ordered so that the highest-risk condition clears first and no step depends on a
 6. **`core/report` and `core/ui`.** Provenance, CSV BOM and control-character sanitization, listbox, and document rebinding. DocStats binds `app.activeDocument` once at load and never rebinds, so it can report against a document that is no longer active.
 7. **Repository metadata across all repositories.** License, tags, changelog, actions, topics.
 8. **DocStats census work.** Style census across all style classes, and an independent instance census. The instance census closes the `NO_APPLICABLE_INSTANCE` hole in StyleFix: a capability matrix claiming zero tables can be checked against an independent count rather than believed. Much of the counting already exists in the v1.1.0 statistics block.
-9. **StyleFix adopts core.** After v1.0.8 passes its canary. The multi-module loader parity mechanism retires at this point, replaced by single-file distribution.
+9. **StyleFix adopts core.** After v1.0.8 passes its canary and the section 8 production-discrimination gate is applied to its object-valued and sentinel-valued fingerprint fields. The multi-module loader parity mechanism retires at this point, replaced by single-file distribution.
 
 Steps 1 through 4 are defect corrections and should not wait on the structural work in step 5. The shared modules can begin life inside one tool and move to the suite repository when it exists.
+
+---
+
+## 8. Production discrimination and host-object identity
+
+Synthetic canaries establish controlled behavior. Production-shaped discrimination establishes that the fixture model represents the document states the tool will encounter. Both forms of proof are required for property classes that can hide behind default, null, sentinel, object-reference, or container behavior.
+
+### 8.1 NormalFix production-sweep evidence
+
+The August 21, 2026 NormalFix production-manuscript read-only sweep exercised the frozen 243-key read surface against all 2,883 `NF-001` Normal+ targets in a 505-page, 23-story manuscript under InDesign 21.5.1.73 / DOM 21.5.
+
+The sweep established two completed proof surfaces:
+
+- paragraph locator: 2,883 of 2,883 targets resolved to exactly one candidate, with zero locator failures;
+- exact-key/applicability contract: zero key-set mismatches and zero unexpected `NOT_APPLICABLE` targets.
+
+The sweep also exposed two unresolved proof surfaces:
+
+- snapshot readiness failed on all 2,883 targets. The recurring failures were `characters.appliedLanguage`, `characters.fillColor`, `paragraph.bulletsCharacterStyle`, and `paragraph.numberingCharacterStyle`. All four are object-valued properties. No scalar or enum property produced this failure class. The initial repair target is therefore the common host-object identity/serialization contract rather than four property-specific patches;
+- `composition.frameSpanSignature` was unreadable on all 2,883 targets. That failure is tracked separately from host-object identity. The production sweep used direct `Paragraph.parentTextFrames`; the earlier composition stability canary that passed used line/insertion-point frame resolution. This implementation difference is evidence for the diagnostic hypothesis, not a diagnosis. Shared `core/location` changes wait for production canary evidence identifying the failing operation.
+
+The sweep's roughly 11-hour runtime also exposed a near-linear per-object failure cost. The diagnostic canary records the individual host-resolution operations and the legacy resolver timing before any cache or performance optimization is considered. Correct identity comes before memoization.
+
+### 8.2 Production discrimination gate
+
+A property is subject to the production-discrimination gate when it is any of the following:
+
+- object-valued;
+- container-sensitive;
+- universally `NOT_APPLICABLE`, null, default-valued, or otherwise sentinel-valued in the available fixture/population;
+- dependent on a host collection or host-object re-resolution path whose production cardinality can differ from a synthetic fixture.
+
+Admission to a production proof surface requires:
+
+1. at least one value that existed in the document before the diagnostic script started;
+2. a positive discriminating case proving the property can return a real non-default/non-sentinel value where such a value is possible;
+3. for host-object identity, a serialize/strict-resolve round trip against document-resident state;
+4. a negative/refusal case proving that changed semantic identity, ambiguity, or contradictory supplemental evidence is rejected rather than guessed;
+5. production-shaped container coverage for container-sensitive properties;
+6. version binding to the InDesign application build and DOM version used for the proof.
+
+A synthetic fixture can satisfy controlled mutation/reconstruction proof but cannot, by itself, satisfy this gate for these property classes.
+
+`characters.kerningValue` remains in the NormalFix coverage set pending a deliberate positive-discrimination case. Universal `NOT_APPLICABLE` on one manuscript is not evidence that the key is dead or meaningful. A deliberate non-default kerning case must prove that the read path can return real state. `characters.strokeColor` similarly requires at least one pre-existing non-default stroke case because the production manuscript may simply lack that state.
+
+### 8.3 Host-object identity contract and proposed `core/identity`
+
+Rollback and digest machinery must store durable semantic identity rather than a live ExtendScript host object or an opaque object reference that is accepted merely because it resolves.
+
+The proposed shared `core/identity` module is promoted only after the NormalFix production and adversarial identity canaries pass. Its contract is:
+
+- **Language:** semantic language name is primary identity; concrete type and ID are supplemental when exposed.
+- **CharacterStyle / ParagraphStyle:** qualified style-group path plus leaf name is primary identity; ID is supplemental.
+- **Swatch / Color:** document-scoped name is primary identity, with qualified group path included where the host exposes meaningful grouping; ID is supplemental.
+- **Font:** PostScript name is primary; full name/name are fallbacks only when PostScript name is unavailable.
+- **Other registered host families:** family-specific semantic identity and bounded candidate collection are explicit in the registry.
+- **Unknown host families:** `UNSUPPORTED_TYPE`. Generic name matching is prohibited.
+
+Resolution is exact or refused. A style with the same leaf name at a different qualified path is a different style. A renamed or moved object whose stored ID still resolves does not satisfy the old semantic identity. A successful `app.resolve(specifier)` is only a candidate fast path and must pass the same semantic verification before acceptance.
+
+Supplemental signals never override semantic identity:
+
+- semantic identity and supplemental ID agree: `RESOLVED`;
+- semantic identity matches but ID disagrees: `IDENTITY_CONFLICT`;
+- semantic identity has no candidate but stored ID points to a renamed/moved object: `IDENTITY_CONFLICT`;
+- multiple semantic candidates: `AMBIGUOUS_IDENTITY`;
+- no candidate: `UNRESOLVED_IDENTITY`.
+
+Any unsupported, unresolved, ambiguous, or conflicting host state makes the snapshot unready and blocks mutation for that target.
+
+Candidate search is family-specific and bounded. Language resolution searches language collections; CharacterStyle resolution searches character styles; Swatch resolution searches swatches; Font enumeration is reserved for Font identity. Cross-family exhaustive fallback is prohibited.
+
+### 8.4 Required NormalFix diagnostic sequence
+
+NormalFix uses two separate canaries before production code changes:
+
+1. **Bare production diagnostic.** Read-only, no ScriptWatch Harness, using selected real targets from the production sweep. It probes `appliedLanguage`, `fillColor`, bullets/numbering CharacterStyle, `strokeColor`, `kerningValue`, object resolution timing, and both frame-span access paths. Its job is diagnosis, not remediation.
+2. **Adversarial identity-refusal canary.** Runs only against a disposable saved/reopened document. Duplicate style leaf names in different groups, group/style identity changes, swatch rename, and conflicting supplemental IDs must refuse rather than guess.
+
+After both canaries establish the failure mechanism and the common identity repair passes, a 20-to-50-target production-manuscript rerun adopts ScriptWatch Harness 1.2 for the first time. That run measures correctness, performance, and observability overhead against the pre-Harness long-tail control.
+
+Production `NormalFix.jsx` remains unchanged until these gates complete.
+
+### 8.5 StyleFix inheritance
+
+StyleFix inherits this gate when active work resumes. Its synthetic fingerprint/capability canaries do not by themselves certify object-valued fields such as fill color, stroke color, and applied language. Those fields require production-document discrimination before the LOW set or any remediation decision can rely on them.

@@ -2,6 +2,7 @@
 
 **Scope:** DocStats, HeaderFix, NormalFix, TableFix
 **Deferred:** StyleFix adopts after its v1.0.8 canary passes. Nothing here requires a change to StyleFix while that work is in progress, and the contracts below are written so StyleFix can adopt them without redesign.
+**Cross-cutting suite service:** ScriptWatch spans the tool suite as shared observability infrastructure and does not own document regions. Suite tools adopt the ScriptWatch Harness so they can publish job semantics to the ScriptWatch console. External or community scripts may opt in to the same Harness contract. ScriptWatch retains agentless process and host telemetry when no Harness is present.
 **Status:** Proposed. Editorial authority is Johann Darby.
 
 **Canonical location:** this document lives in the DocStats repository and is the single authoritative copy. Other repositories link to it and never carry their own copy. A specification that exists to prevent divergence must not itself be duplicated.
@@ -35,6 +36,9 @@ localis-indesign-tools/          suite repository
 tool repositories                one per tool, consuming core
     src/                         tool-specific source
     dist/ToolName.jsx            generated, committed, installable
+ScriptWatch repository           cross-cutting runtime observer
+    ScriptWatchHeartbeat.jsxinc  heartbeat transport
+    ScriptWatchJob.jsxinc        ScriptWatch Harness
 ```
 
 The build inliner concatenates the required core modules with the tool source and writes one file to `dist/`, stamping a header block with tool version, core version, build timestamp, and a hash of each contributing source file.
@@ -42,6 +46,8 @@ The build inliner concatenates the required core modules with the tool source an
 This resolves three separate problems at once. Practitioners install one file. Installed-artifact parity becomes trivially checkable, because there is one artifact. The multi-module loader parity mechanism StyleFix is currently carrying becomes unnecessary rather than permanent.
 
 A GitHub Action runs the build and fails on any mismatch between the committed `dist/` file and a fresh build.
+
+ScriptWatch remains a cross-cutting repository rather than a document-ownership tool. For suite builds, `ScriptWatchHeartbeat.jsxinc` and `ScriptWatchJob.jsxinc` are source components and are inlined into the generated single-file distribution with the other required modules. Practitioners still install one generated `.jsx` file. Authors integrating ScriptWatch into a script outside the suite may include the two `.jsxinc` files directly.
 
 ---
 
@@ -120,6 +126,7 @@ CSV output rules for every tool: UTF-8 with BOM, Windows line endings, all field
 |---|---|
 | Tool name, tool version | |
 | Core version, build hash | from the generated header |
+| ScriptWatch Harness version | exact Harness contract when instrumented; `NOT_INSTRUMENTED` when no Harness is present |
 | Run timestamp | |
 | Document name, path, file modified | |
 | InDesign version and build | report `NOT_EXPOSED` rather than an empty field |
@@ -139,6 +146,34 @@ Two fixes land here for all four tools simultaneously. Space-padded columns do n
 ### 3.8 `core/boot`
 
 Version constants, artifact parity check, measurement-unit normalization to points with restore, and redraw suppression with restore.
+
+### 3.9 Cross-cutting observability: ScriptWatch
+
+ScriptWatch is horizontal suite infrastructure. It observes DocStats, HeaderFix, NormalFix, TableFix, StyleFix when adopted, and future tools through two independent acquisition paths.
+
+**Agentless acquisition.** `scriptwatch.py` and `scriptwatch_web.py` observe the InDesign process and host from outside InDesign. This path requires no modification to the observed script and remains available when a script publishes no heartbeat. Process CPU, private memory, working set, threads, handles, process uptime, host physical-memory use, and host commit data belong to this path.
+
+**Harness acquisition.** The ScriptWatch Harness is the reusable code part a script includes when it wants the ScriptWatch console to understand the work inside the process. The canonical source components live in the ScriptWatch repository and are included in this order:
+
+```javascript
+#include "ScriptWatchHeartbeat.jsxinc"
+#include "ScriptWatchJob.jsxinc"
+```
+
+`ScriptWatchHeartbeat.jsxinc` owns the fail-isolated heartbeat transport. `ScriptWatchJob.jsxinc` owns the shared job contract and is the preferred adoption point for suite tools. Observation failure must never stop the tool. If the heartbeat transport is absent or unavailable, Harness calls degrade to no-op observation while tool work continues.
+
+The Harness provides two execution shapes:
+
+- `ScriptWatchJob.run()` for collection-driven work where one outer-loop target is the ETA unit.
+- `ScriptWatchJob.begin()` for phase-driven work where the tool advances through named stages rather than a target collection.
+
+The shared Harness contract standardizes target progress, PASS/FAIL counts, checkpoint cadence, notes, terminal state, and Harness version provenance. `false` and thrown errors report FAIL; any other return reports PASS. A failing target continues by default. `continueOnError: false` converts the first failure into an `ABORTED` terminal state and rethrows to the caller. Terminal publication occurs in `finally` so a completed or aborted tool does not leave a live RUNNING heartbeat behind.
+
+The Harness publishes `<tool> · harness <version>` in the heartbeat note. ScriptWatch persists that note into runtime CSV data so later analysis can identify the exact Harness contract used by a run. Harness version changes are deliberate contract revisions rather than incidental source edits.
+
+**Integration boundary with `core/mutate`.** ScriptWatch observes work; `core/mutate` owns document mutation safety. Harness progress, checkpoints, notes, and status must not replace target re-resolution, precheck, snapshot, digest coverage, verification, rollback, durable mutation journaling, or batch hard-stop semantics. A mutation tool whose loop is owned by `core/mutate` uses the phase/session Harness form or an explicit reporting bridge rather than creating a second competing target loop.
+
+**Third-party integration.** A script outside the suite can become ScriptWatch-aware by adding the two Harness code parts and describing its work through `run()` or `begin()`. The external observer remains useful without that integration, but only Harness-enabled scripts can publish semantic job data such as target count, PASS/FAIL, checkpoint, phase notes, and terminal state.
 
 ---
 
@@ -172,7 +207,7 @@ A second overlap is already in shipped code. TableFix owns tables and owns heade
 
 ## 6. Repository metadata standard
 
-Applies to all five repositories.
+Applies to the five document-tool repositories and to the ScriptWatch repository where applicable.
 
 | Item | Standard |
 |---|---|
@@ -186,6 +221,7 @@ Applies to all five repositories.
 | GitHub Action | Build, `dist/` freshness check, version parity check. |
 | Repository topics | `indesign`, `extendscript`, `publishing`, `epub`, `typesetting`. Discoverability is the whole point of a community release. |
 | Repository description | One descriptive sentence in a consistent register. |
+| ScriptWatch integration | Suite tool READMEs identify whether the generated artifact includes the ScriptWatch Harness and record the Harness contract version. External/community tools may document optional Harness integration without adopting suite ownership or mutation contracts. |
 
 **Note on safety posture.** Writing this down forces an existing inconsistency into the open. NormalFix and TableFix both state that selection is the remediation boundary and that no document-wide Fix All exists. HeaderFix provides Fix All Errors and Clear All Overrides. The exception may be defensible, since the marker population is small and unambiguous, but three tools in one suite should not carry two safety postures by accident.
 
@@ -200,6 +236,8 @@ In the ownership model DocStats is the inventory tool, and the style census Styl
 ## 7. Adoption sequence
 
 Ordered so that the highest-risk condition clears first and no step depends on a later one.
+
+**ScriptWatch Harness adoption is horizontal rather than a numbered dependency.** Suite tools add the Harness as their current canary/release work permits. Because ScriptWatch observation is fail-isolated and does not own mutation semantics, Harness adoption may proceed in parallel with the steps below and must not delay `core/mutate` safety work. New suite tools include the Harness from their first instrumented build.
 
 1. **`core/mutate`, adopted by NormalFix and DocStats.** Undo grouping, per-item rollback, and read-back verification. This is the only step addressing conditions capable of damaging a document in the suite's current state. Within it, NormalFix's partial-mutation path and DocStats `relinkAsset` are the two highest-consequence items.
 2. **`core/color`.** The name-bypass and tint corrections. Adopted by NormalFix and TableFix together.

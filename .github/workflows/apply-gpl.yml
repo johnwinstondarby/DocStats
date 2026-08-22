@@ -1,0 +1,259 @@
+name: Apply GPL-3.0-or-later
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/apply-gpl.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply-license:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply and verify GPL-3.0-or-later
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          EXPECTED_GPL_SHA256="3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986"
+
+          case "${GITHUB_REPOSITORY##*/}" in
+            DocStats)
+              TOOL_NAME="DocStats"
+              TOOL_DESC="DocStats - inventory and preflight reporting for Adobe InDesign documents"
+              ;;
+            stylefix)
+              TOOL_NAME="StyleFix"
+              TOOL_DESC="StyleFix - character style auditing for Adobe InDesign documents"
+              ;;
+            NormalFix)
+              TOOL_NAME="NormalFix"
+              TOOL_DESC="NormalFix - body paragraph style repair for Adobe InDesign documents"
+              ;;
+            TableFix)
+              TOOL_NAME="TableFix"
+              TOOL_DESC="TableFix - table header semantics repair for Adobe InDesign documents"
+              ;;
+            HeaderFix)
+              TOOL_NAME="HeaderFix"
+              TOOL_DESC="HeaderFix - section header style normalization for Adobe InDesign documents"
+              ;;
+            ScriptWatch)
+              TOOL_NAME="ScriptWatch"
+              TOOL_DESC="ScriptWatch - runtime observer console for long-running InDesign ExtendScript jobs"
+              ;;
+            *)
+              echo "::error::Unknown repository ${GITHUB_REPOSITORY}"
+              exit 1
+              ;;
+          esac
+          export TOOL_NAME TOOL_DESC
+
+          # Stop if a likely vendored third-party source tree appears.
+          if find . -type d \( -name vendor -o -name vendors -o -name third_party -o -name third-party -o -name node_modules -o -name external -o -name externals \) -not -path './.git/*' -print -quit | grep -q .; then
+            echo "::error::Potential vendored third-party code detected. Stop for manual licensing review."
+            exit 1
+          fi
+
+          # Task A: canonical GPL-3.0 text, byte-for-byte verified.
+          if [ -e LICENSE ]; then
+            current_sha="$(sha256sum LICENSE | awk '{print $1}')"
+            if [ "$current_sha" != "$EXPECTED_GPL_SHA256" ]; then
+              echo "::error::Existing LICENSE does not match canonical GPL-3.0 text."
+              exit 1
+            fi
+          else
+            curl --fail --location --silent --show-error --retry 3 \
+              https://www.gnu.org/licenses/gpl-3.0.txt -o LICENSE
+            actual_sha="$(sha256sum LICENSE | awk '{print $1}')"
+            if [ "$actual_sha" != "$EXPECTED_GPL_SHA256" ]; then
+              echo "::error::Downloaded GPL text failed SHA-256 verification: $actual_sha"
+              rm -f LICENSE
+              exit 1
+            fi
+            git add LICENSE
+            git commit -m "Add GPL-3.0 license text"
+          fi
+
+          # Task B: add the canonical GNU application notice plus SPDX marker.
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          tool_desc = os.environ["TOOL_DESC"]
+          exts = {".jsx", ".jsxinc", ".py", ".html", ".css", ".js"}
+          skip_dirs = {".git", ".github", "__pycache__"}
+
+          notice_lines = [
+              tool_desc,
+              "Copyright (C) 2026 John Darby",
+              "",
+              "This program is free software: you can redistribute it and/or modify",
+              "it under the terms of the GNU General Public License as published by",
+              "the Free Software Foundation, either version 3 of the License, or",
+              "(at your option) any later version.",
+              "",
+              "This program is distributed in the hope that it will be useful,",
+              "but WITHOUT ANY WARRANTY; without even the implied warranty of",
+              "MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the",
+              "GNU General Public License for more details.",
+              "",
+              "You should have received a copy of the GNU General Public License",
+              "along with this program.  If not, see <https://www.gnu.org/licenses/>.",
+              "",
+              "SPDX-License-Identifier: GPL-3.0-or-later",
+          ]
+
+          def block_comment(nl):
+              body = []
+              for line in notice_lines:
+                  body.append(" *" + (" " + line if line else ""))
+              return "/*" + nl + nl.join(body) + nl + " */" + nl + nl
+
+          def html_comment(nl):
+              return "<!--" + nl + nl.join(notice_lines) + nl + "-->" + nl + nl
+
+          def python_comment(nl):
+              return nl.join("#" + (" " + line if line else "") for line in notice_lines) + nl + nl
+
+          changed = []
+          for path in sorted(Path(".").rglob("*")):
+              if not path.is_file() or path.suffix.lower() not in exts:
+                  continue
+              if any(part in skip_dirs for part in path.parts):
+                  continue
+
+              raw = path.read_bytes()
+              has_bom = raw.startswith(b"\xef\xbb\xbf")
+              payload = raw[3:] if has_bom else raw
+              text = payload.decode("utf-8")
+              if "SPDX-License-Identifier:" in text:
+                  continue
+              nl = "\r\n" if b"\r\n" in payload else "\n"
+              ext = path.suffix.lower()
+
+              if ext in {".jsx", ".jsxinc", ".css", ".js"}:
+                  new_text = block_comment(nl) + text
+              elif ext == ".html":
+                  match = re.match(r"(?is)^(\s*<!doctype\s+html\s*>)(.*)$", text)
+                  if match:
+                      new_text = match.group(1) + nl + html_comment(nl) + match.group(2).lstrip("\r\n")
+                  else:
+                      new_text = html_comment(nl) + text
+              else:
+                  lines = text.splitlines(keepends=True)
+                  insert_at = 0
+                  if lines and lines[0].startswith("#!"):
+                      insert_at = 1
+                  encoding_re = re.compile(r"coding[:=]\s*[-\w.]+")
+                  for i in range(min(2, len(lines))):
+                      if encoding_re.search(lines[i]):
+                          insert_at = max(insert_at, i + 1)
+                  lines.insert(insert_at, python_comment(nl))
+                  new_text = "".join(lines)
+
+              out = new_text.encode("utf-8")
+              if has_bom:
+                  out = b"\xef\xbb\xbf" + out
+              path.write_bytes(out)
+              changed.append(str(path))
+
+          print(f"Source notices added: {len(changed)}")
+          for item in changed:
+              print(f"  {item}")
+          PY
+
+          if ! git diff --quiet -- '*.jsx' '*.jsxinc' '*.py' '*.html' '*.css' '*.js'; then
+            git add -- '*.jsx' '*.jsxinc' '*.py' '*.html' '*.css' '*.js'
+            git commit -m "Add GPL-3.0-or-later notices to source files"
+          else
+            echo "No authored source files required notice changes."
+          fi
+
+          # Task C: update README, including removal of StyleFix's superseded status sentence.
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          tool = os.environ["TOOL_NAME"]
+          path = Path("README.md")
+          text = path.read_text(encoding="utf-8")
+
+          text = text.replace(
+              "A formal open-source license has not yet been selected. Use StyleFix on backed-up documents and validate results independently. The software is provided without warranty.",
+              "Use StyleFix on backed-up documents and validate results independently. The software is provided without warranty.",
+          )
+
+          section = f"""## License
+
+          Copyright (C) 2026 John Darby
+
+          {tool} is free software, released under the GNU General Public License,
+          version 3 or later. You may redistribute and modify it under those terms.
+          See [LICENSE](LICENSE) for the full text.
+
+          This program is distributed in the hope that it will be useful, but WITHOUT
+          ANY WARRANTY. See the GNU General Public License for details.
+          """
+
+          if "## License" not in text:
+              text = text.rstrip() + "\n\n" + section
+          path.write_text(text, encoding="utf-8", newline="\n")
+          PY
+
+          if ! git diff --quiet -- README.md; then
+            git add README.md
+            git commit -m "Document license in README"
+          fi
+
+          # Task D: verify before publishing the commits.
+          python3 - <<'PY'
+          from pathlib import Path
+
+          exts = {".jsx", ".jsxinc", ".py", ".html", ".css", ".js"}
+          skip_dirs = {".git", ".github", "__pycache__"}
+          problems = []
+          source_count = 0
+
+          for path in sorted(Path(".").rglob("*")):
+              if not path.is_file() or path.suffix.lower() not in exts:
+                  continue
+              if any(part in skip_dirs for part in path.parts):
+                  continue
+              source_count += 1
+              text = path.read_text(encoding="utf-8-sig")
+              if "SPDX-License-Identifier: GPL-3.0-or-later" not in text:
+                  problems.append(f"missing SPDX: {path}")
+              if "(at your option) any later version." not in text:
+                  problems.append(f"missing or-later clause: {path}")
+              if "Copyright (C) 2026 John Darby" not in text:
+                  problems.append(f"copyright mismatch: {path}")
+              if "Copyright (C) 2026 Johann Darby" in text:
+                  problems.append(f"wrong copyright name: {path}")
+
+          readme = Path("README.md").read_text(encoding="utf-8")
+          if "## License" not in readme or "version 3 or later" not in readme:
+              problems.append("README license section missing or incomplete")
+
+          if problems:
+              for problem in problems:
+                  print(f"::error::{problem}")
+              raise SystemExit(1)
+
+          print(f"Verification PASS: {source_count} authored source files covered")
+          PY
+
+          final_sha="$(sha256sum LICENSE | awk '{print $1}')"
+          test "$final_sha" = "$EXPECTED_GPL_SHA256"
+
+          git push origin HEAD:main
